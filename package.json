@@ -1,5 +1,5 @@
 {
-  "name": "pi-huff",
+  "name": "@roodriigoooo/pi-huff",
   "version": "0.1.0",
   "description": "Shiki-highlighted terminal diffs and a read-only Hunk review bridge for the pi coding agent.",
   "type": "module",
@@ -7,9 +7,9 @@
   "author": "rosastre",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/rosastre/pi-huff.git"
+    "url": "git+https://github.com/roodriigoooo/pi-huff.git"
   },
-  "homepage": "https://github.com/rosastre/pi-huff",
+  "homepage": "https://github.com/roodriigoooo/pi-huff",
   "files": [
     "src",
     "README.md",
