@@ -1,7 +1,8 @@
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import { spawn } from "node:child_process";
 import type { HuffConfig } from "./config";
-import { displayPath } from "./paths";
+import { parseUnifiedPatch, type ParsedPatch } from "./diff-view";
+import { displayPath, fileKey } from "./paths";
 
 // ============================================================================
 // Types
@@ -199,6 +200,52 @@ function buildReviewPrompt(comments: HunkComment[], cwd: string): string {
 	return lines.join("\n");
 }
 
+export type RenderRecordLike = {
+	tool: "write" | "edit";
+	filePath: string;
+	patch: string;
+	summary: string;
+};
+
+/** Line ranges a patch touches on its new side (additions + their context),
+ *  as [start, end] inclusive new-line numbers. Used to correlate human notes
+ *  to the edit they refer to. */
+function touchedNewLineRanges(patch: string): Array<[number, number]> {
+	const parsed: ParsedPatch = parseUnifiedPatch(patch);
+	const ranges: Array<[number, number]> = [];
+	for (const hunk of parsed.hunks) {
+		let start: number | undefined;
+		let end: number | undefined;
+		for (const line of hunk.lines) {
+			if (line.kind === "add" || line.kind === "context") {
+				const n = line.newLine;
+				if (n === undefined) continue;
+				if (start === undefined) start = n;
+				end = n;
+			}
+		}
+		if (start !== undefined && end !== undefined) ranges.push([start, end]);
+	}
+	return ranges;
+}
+
+/** True if a note's pinned line falls inside a record's touched new-line range
+ *  for the same file. Falls back to oldLine when newLine is absent. */
+function noteOverlapsRecord(note: HunkComment, record: RenderRecordLike, cwd: string): boolean {
+	if (fileKey(note.filePath, cwd) !== fileKey(record.filePath, cwd)) return false;
+	const line = note.newLine ?? note.oldLine;
+	if (line === undefined) return false;
+	return touchedNewLineRanges(record.patch).some(([s, e]) => line >= s && line <= e);
+}
+
+/** Filter notes to those overlapping any recent edit. Pure + testable. */
+export function notesRelevantToRecords(notes: HunkComment[], findRecent: (filePath: string | undefined, cwd: string) => RenderRecordLike | undefined, cwd: string): HunkComment[] {
+	return notes.filter((note) => {
+		const record = findRecent(note.filePath, cwd);
+		return record ? noteOverlapsRecord(note, record, cwd) : false;
+	});
+}
+
 // ============================================================================
 // ReviewBridge — live session → semantic notes, with pickup/dedup policy
 // ============================================================================
@@ -220,7 +267,7 @@ export interface ReviewBridge {
 	renderNotesLines(result: ReviewNotesResult | undefined, cwd: string, theme: Theme): string[];
 }
 
-export function createHunkBridge(): ReviewBridge {
+export function createHunkBridge(findRecent?: (filePath: string | undefined, cwd: string) => RenderRecordLike | undefined): ReviewBridge {
 	let lastSignature = "";
 
 	return {
@@ -254,12 +301,18 @@ export function createHunkBridge(): ReviewBridge {
 		async pickup(cwd, config, signal) {
 			const result = await this.readNotes(cwd, config, signal);
 			if (!config.hunk.autoReviewNotes || !result.live) return { result, inject: false };
+			// Scope to notes that overlap a recent edit. The count threshold applies
+			// to the *relevant* set, so notes about untouched files never trigger
+			// pickup on their own. When no findRecent seam is wired (older callers),
+			// fall back to the legacy flat-count behavior on all notes.
+			const relevant = findRecent ? notesRelevantToRecords(result.comments, findRecent, cwd) : result.comments;
+			const scoped: ReviewNotesResult = relevant.length === result.comments.length ? result : { ...result, comments: relevant, message: buildReviewPrompt(relevant, cwd) };
 			const min = Math.max(1, config.hunk.autoReviewNotesMin);
-			if (result.comments.length < min) return { result, inject: false };
-			const signature = reviewNotesSignature(result.comments, cwd);
-			if (signature === lastSignature) return { result, inject: false };
+			if (relevant.length < min) return { result: scoped, inject: false };
+			const signature = reviewNotesSignature(scoped.comments, cwd);
+			if (signature === lastSignature) return { result: scoped, inject: false };
 			lastSignature = signature;
-			return { result, inject: true };
+			return { result: scoped, inject: true };
 		},
 
 		resetSignature() {

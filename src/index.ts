@@ -101,7 +101,7 @@ export default async function (pi: ExtensionAPI) {
 	let liveHunkSession = false;
 
 	const records = createRenderRecordStore();
-	const bridge = createHunkBridge();
+	const bridge = createHunkBridge((filePath, cwd) => records.findRecent(filePath, cwd));
 
 	async function rebuildHighlighter(nextConfig: HuffConfig): Promise<void> {
 		const key = highlighterKey(nextConfig);

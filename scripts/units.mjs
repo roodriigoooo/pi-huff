@@ -41,7 +41,9 @@ const jiti = createJiti(import.meta.url, {
 
 const { parseUnifiedPatch, renderDiffLines } = await jiti.import(path.join(repoRoot, "src", "diff-view.ts"), { default: false });
 const { DEFAULT_CONFIG, ansiFg } = await jiti.import(path.join(repoRoot, "src", "config.ts"), { default: false });
-const { normalizeHunkComments } = await jiti.import(path.join(repoRoot, "src", "hunk-bridge.ts"), { default: false });
+const { normalizeHunkComments, createHunkBridge } = await jiti.import(path.join(repoRoot, "src", "hunk-bridge.ts"), { default: false });
+const { createRenderRecordStore } = await jiti.import(path.join(repoRoot, "src", "render-records.ts"), { default: false });
+const { writePatch } = await jiti.import(path.join(repoRoot, "src", "diff-view.ts"), { default: false });
 
 function fakeTheme() {
 	const colors = {
@@ -257,6 +259,55 @@ assert.equal(altFields[0].author, "human");
 	const cjkAdded = cjkRendered.find((line) => stripAnsi(line).includes("巴"));
 	assert.ok(cjkAdded, "cjk added line rendered");
 	assert.equal((cjkAdded.match(/\x1b\[1m/g) ?? []).length, 1, "exactly the changed CJK char is bold");
+}
+
+// --- I: note-to-edit scoped auto-pickup ------------------------------------
+
+// Auto-pickup must inject only notes that overlap a recent edit by
+// (file, line). A note about an untouched file must NOT trigger injection,
+// even when the note count meets the threshold. The flat count threshold is a
+// fallback, not the primary rule.
+//
+// The bridge needs recent records to correlate against; the store lives in the
+// extension closure. createHunkBridge accepts an optional findRecent(filePath,
+// cwd) seam so the bridge can query the store without owning it.
+{
+	const cwd = repoRoot;
+	const store = createRenderRecordStore();
+	// A recent edit to src/app.ts that touches new lines 3..5.
+	store.record("call-1", {
+		tool: "edit",
+		filePath: path.join(cwd, "src", "app.ts"),
+		patch: writePatch("a/src/app.ts", "b/src/app.ts", "line1\nline2\nold\nold\nold\nline6\n", "line1\nline2\nnewA\nnewB\nnewC\nline6\n"),
+		summary: "edited app.ts",
+	});
+
+	// findRecent seam: bridge queries by file path, store resolves to the record.
+	const findRecent = (filePath) => store.findRecent(filePath, cwd);
+	const bridge = createHunkBridge(findRecent);
+
+	// Override readNotes so we don't shell out to hunk; inject a controlled set.
+	const notesOnEdit = { id: "n1", type: "user", filePath: "src/app.ts", newLine: 4, summary: "on the edit" };
+	const notesOffEdit = { id: "n2", type: "user", filePath: "src/other.ts", newLine: 99, summary: "unrelated" };
+	const fakeResult = (comments) => ({ live: true, session: { id: "s" }, comments, message: "" });
+	bridge.readNotes = async () => fakeResult([notesOnEdit, notesOffEdit]);
+
+	const config = { ...DEFAULT_CONFIG, hunk: { ...DEFAULT_CONFIG.hunk, enabled: true, autoReviewNotes: true, autoReviewNotesMin: 2 } };
+
+	// Desired: only the on-edit note is relevant. With 2 notes but only 1
+	// relevant, and min=2 as a *fallback* on the relevant set, this should NOT
+	// inject (1 relevant < 2). Dropping min to 1 should inject the 1 relevant.
+	const { result: r1, inject: inj1 } = await bridge.pickup(cwd, config);
+	assert.equal(inj1, false, "two notes but only one overlaps an edit, min=2 → no inject");
+	assert.equal(r1.comments.length, 1, "result carries only relevant notes");
+	assert.equal(r1.comments[0].summary, "on the edit", "the relevant note is the on-edit one");
+
+	bridge.resetSignature();
+	const configMin1 = { ...config, hunk: { ...config.hunk, autoReviewNotesMin: 1 } };
+	const { result: r2, inject: inj2 } = await bridge.pickup(cwd, configMin1);
+	assert.equal(inj2, true, "one relevant note meets min=1 → inject");
+	assert.equal(r2.comments.length, 1, "only the relevant note is injected");
+	assert.equal(r2.comments[0].summary, "on the edit");
 }
 
 console.log("pi-huff units ok");
