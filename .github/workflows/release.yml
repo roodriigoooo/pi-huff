@@ -26,6 +26,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
+          registry-url: https://registry.npmjs.org/
           cache: npm
 
       - name: Install package dependencies
@@ -80,7 +81,14 @@ jobs:
 
       - name: Publish npm package
         if: steps.npm.outputs.published != 'true'
-        run: npm publish --access public --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN || vars.NPM_TOKEN }}
+        run: |
+          if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
+            echo "NPM_TOKEN is not available to this workflow. Add it as a repository secret or variable." >&2
+            exit 1
+          fi
+          npm publish --access public --provenance
 
       - name: Pack npm artifact
         run: npm pack
