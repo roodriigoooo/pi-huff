@@ -300,6 +300,14 @@ process.exit(2);
 	assert.match(sentUserMessages[0].content, /tighten the greeting/);
 	assert.equal(sentUserMessages[0].options.deliverAs, "followUp");
 
+	// /huff review pairs notes with recent edits (read-only, human-facing).
+	const reviewBefore = configureSnapshots.length;
+	await commands.get("huff").handler("review", ctx);
+	const reviewSnap = configureSnapshots.slice(reviewBefore).join("\n");
+	assert.match(reviewSnap, /Hunk review/, "/huff review renders review header");
+	// both smoke notes are on smoke.ts newLine 1, which the edit above touched
+	assert.match(reviewSnap, /addressed/i, "/huff review marks overlapping notes addressed");
+
 	const huffDir = path.join(tmp, ".pi", "huff");
 	let sidecars = [];
 	try {
@@ -310,11 +318,13 @@ process.exit(2);
 	const finalFile = await readFile(path.join(tmp, "smoke.ts"), "utf8");
 	assert.equal(finalFile, await readFile(path.join(tmp, "smoke.ts"), "utf8"), "hello huff\n");
 
+	const configureStart = configureSnapshots.length;
 	await commands.get("huff").handler("configure", ctx);
-	assert.ok(configureSnapshots[0].includes("Huff Configuration"), "configure opens with title");
-	assert.ok(configureSnapshots[0].includes("Side colors & words"), "configure shows group nav");
-	assert.ok(configureSnapshots[1].includes("word emphasis"), "enter descends into a group showing its settings");
-	assert.ok(configureSnapshots.some((snapshot) => /↑↓ move · Enter select/.test(snapshot)), "second enter opens a picker inside the group");
+	const cfgSnapshots = configureSnapshots.slice(configureStart);
+	assert.ok(cfgSnapshots[0].includes("Huff Configuration"), "configure opens with title");
+	assert.ok(cfgSnapshots[0].includes("Side colors & words"), "configure shows group nav");
+	assert.ok(cfgSnapshots.some((s) => s.includes("word emphasis")), "enter descends into a group showing its settings");
+	assert.ok(cfgSnapshots.some((snapshot) => /↑↓ move · Enter select/.test(snapshot)), "second enter opens a picker inside the group");
 
 	console.log("pi-huff smoke ok");
 } finally {

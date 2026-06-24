@@ -27,7 +27,8 @@ You need the `hunk` CLI on your PATH only if you use the review bridge. The diff
 
 - `/huff status` probes `hunk session get --repo <cwd>` and reports whether a live Hunk session is attached.
 - `/huff send` reads `hunk session comment list --repo <cwd> --type user --json`, shapes the user notes by file and line, and sends them to the agent as a follow-up when idle or as steering when streaming.
-- `/huff auto on|off` opts in to automatic pickup before each agent turn. `on` sends notes only when at least two user notes exist, and unchanged duplicate notes are not re-sent.
+- `/huff auto on|off` opts in to automatic pickup before each agent turn. `on` sends notes only when at least two user notes exist, and unchanged duplicate notes are not re-sent. Pickup is scoped to notes that overlap a recent edit by file and line, so notes about untouched files do not trigger injection on their own.
+- `/huff review` opens a read-only view that pairs each open user note with whether a recent edit touched its line (`✓ addressed`) or not (`○ pending`). It never sends anything to the agent.
 - `/huff configure` opens the configuration TUI.
 
 ## LLM-callable tool
@@ -53,7 +54,7 @@ The check scripts locate pi by `PI_CODING_AGENT_ROOT` or a few common install pa
 - `src/paths.ts` path resolution and display helpers.
 - `src/render-records.ts` in-memory store of recent rendered edits.
 - `src/diff-view.ts` the DiffView module: unified-patch parser, word-emphasis model, and renderer.
-- `src/hunk-bridge.ts` the ReviewBridge module: Hunk CLI exec, comment normalization, note shaping, and pickup and dedup policy.
+- `src/hunk-bridge.ts` the ReviewBridge module: Hunk CLI exec, comment normalization, note shaping, pickup and dedup policy, note-to-edit correlation, and the read-only review pairing.
 - `src/configure.ts` the `/huff configure` TUI.
 - `src/index.ts` extension entry: wires modules and registers tools, commands, and events.
 

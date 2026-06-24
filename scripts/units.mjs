@@ -310,4 +310,43 @@ assert.equal(altFields[0].author, "human");
 	assert.equal(r2.comments[0].summary, "on the edit");
 }
 
+// --- J: /huff review pairs notes with recent edits (read-only) -------------
+
+// renderReviewLines lists each human note with whether a recent edit touched
+// its line (addressed) or not (pending). It must not send anything to the
+// agent; it is a human-facing diagnostic.
+{
+	const cwd = repoRoot;
+	const store = createRenderRecordStore();
+	store.record("call-1", {
+		tool: "edit",
+		filePath: path.join(cwd, "src", "app.ts"),
+		patch: writePatch("a/src/app.ts", "b/src/app.ts", "line1\nline2\nold\nold\nold\nline6\n", "line1\nline2\nnewA\nnewB\nnewC\nline6\n"),
+		summary: "edited app.ts",
+	});
+	const findRecent = (filePath) => store.findRecent(filePath, cwd);
+	const bridge = createHunkBridge(findRecent);
+
+	const result = {
+		live: true,
+		session: { id: "s" },
+		comments: [
+			{ id: "n1", type: "user", filePath: "src/app.ts", newLine: 4, summary: "on the edit", rationale: "why" },
+			{ id: "n2", type: "user", filePath: "src/other.ts", newLine: 99, summary: "untouched file" },
+		],
+		message: "",
+	};
+	const lines = bridge.renderReviewLines(result, findRecent, cwd, fakeTheme());
+	const plain = lines.map(stripAnsi).join("\n");
+	assert.match(plain, /Hunk review/, "review header present");
+	assert.match(plain, /on the edit/, "on-edit note listed");
+	assert.match(plain, /untouched file/, "off-edit note listed");
+	// addressed = a recent edit overlaps the note's line; pending = no overlap.
+	const onEditIdx = lines.findIndex((l) => stripAnsi(l).includes("on the edit"));
+	const offEditIdx = lines.findIndex((l) => stripAnsi(l).includes("untouched file"));
+	assert.ok(onEditIdx >= 0 && offEditIdx >= 0, "both notes rendered");
+	assert.match(stripAnsi(lines[onEditIdx]), /addressed/i, "on-edit note marked addressed");
+	assert.match(stripAnsi(lines[offEditIdx]), /pending/i, "off-edit note marked pending");
+}
+
 console.log("pi-huff units ok");

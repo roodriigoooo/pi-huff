@@ -345,6 +345,47 @@ export function createHunkBridge(findRecent?: (filePath: string | undefined, cwd
 			}
 			return lines;
 		},
+
+		renderReviewLines(result, findRecent, cwd, theme) {
+			const lines: string[] = [];
+			lines.push(`${theme.fg("accent", "✦")} ${theme.fg("borderMuted", "╭─")} ${theme.fg("toolTitle", theme.bold("Hunk review"))}`);
+			if (!result) {
+				lines.push(`${theme.fg("borderMuted", "│")} ${theme.fg("muted", "No result details available.")}`);
+				lines.push(theme.fg("borderMuted", "╰" + "─".repeat(32)));
+				return lines;
+			}
+			if (!result.live) {
+				lines.push(`${theme.fg("borderMuted", "│")} ${theme.fg("warning", "no live session")}`);
+				lines.push(theme.fg("borderMuted", "╰" + "─".repeat(32)));
+				lines.push(theme.fg("muted", result.message));
+				return lines;
+			}
+			if (!result.comments.length) {
+				lines.push(`${theme.fg("borderMuted", "│")} ${theme.fg("muted", "no user notes")}`);
+				lines.push(theme.fg("borderMuted", "╰" + "─".repeat(32)));
+				return lines;
+			}
+			const addressed = result.comments.filter((c) => {
+				const rec = findRecent(c.filePath, cwd);
+				return rec ? noteOverlapsRecord(c, rec, cwd) : false;
+			}).length;
+			const pending = result.comments.length - addressed;
+			lines.push(`${theme.fg("borderMuted", "│")} ${theme.fg("toolDiffAdded", `${addressed} addressed`)} ${theme.fg("dim", "·")} ${theme.fg("warning", `${pending} pending`)}`);
+			lines.push(theme.fg("borderMuted", "╰" + "─".repeat(32)));
+			let index = 1;
+			for (const [file, comments] of groupCommentsByFile(result.comments, cwd)) {
+				lines.push(`${theme.fg("accent", "@@")} ${theme.fg("toolTitle", "notes")} ${theme.fg("dim", "·")} ${theme.fg("muted", file)}`);
+				for (const comment of comments) {
+					const rec = findRecent(comment.filePath, cwd);
+					const isAddressed = rec ? noteOverlapsRecord(comment, rec, cwd) : false;
+					const mark = isAddressed ? theme.fg("toolDiffAdded", "✓ addressed") : theme.fg("warning", "○ pending");
+					lines.push(`${theme.fg("dim", String(index).padStart(2, " "))}. ${theme.fg("toolTitle", commentLocation(comment))} ${theme.fg("dim", "—")} ${comment.summary} ${theme.fg("dim", "·")} ${mark}`);
+					if (comment.rationale) lines.push(`   ${theme.fg("dim", "rationale:")} ${comment.rationale}`);
+					index++;
+				}
+			}
+			return lines;
+		},
 	};
 }
 

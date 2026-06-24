@@ -34,6 +34,7 @@ async function handleHuffCommand(
 	setLiveSession: (live: boolean) => void,
 	resetAutoSignature: () => void,
 	recordCount: () => number,
+	findRecent: (filePath: string | undefined, cwd: string) => { filePath: string; patch: string; summary: string } | undefined,
 	bridge: ReturnType<typeof createHunkBridge>,
 ) {
 	const config = getConfig();
@@ -49,7 +50,7 @@ async function handleHuffCommand(
 		const auto = config.hunk.autoReviewNotes ? `on (min ${config.hunk.autoReviewNotesMin})` : "off";
 		if (live) {
 			const id = stringOr(session?.id ?? session?.sessionId ?? session?.session?.id);
-			ctx.ui.notify(`Huff is active. Recent diffs: ${recordCount()}. Auto review notes: ${auto}. Live Hunk session${id ? `: ${id}` : " detected"}. Commands: /huff status, /huff send, /huff auto on|off.`, "info");
+			ctx.ui.notify(`Huff is active. Recent diffs: ${recordCount()}. Auto review notes: ${auto}. Live Hunk session${id ? `: ${id}` : " detected"}. Commands: /huff status, /huff send, /huff auto on|off, /huff review, /huff configure.`, "info");
 		} else {
 			ctx.ui.notify(`Huff is active. Recent diffs: ${recordCount()}. Auto review notes: ${auto}. No live Hunk session. Open another terminal in this repo and run: hunk diff --watch`, "info");
 		}
@@ -86,7 +87,31 @@ async function handleHuffCommand(
 		ctx.ui.notify(`Sent ${notes.comments.length} Hunk comment(s) to the agent as ${ctx.isIdle() ? "a follow-up" : "steering"}.`, "info");
 		return;
 	}
-	ctx.ui.notify(`Unknown /huff command: ${sub}. Try /huff status, /huff send, /huff auto on|off, or /huff configure.`, "warning");
+	if (sub === "review") {
+		const notes = await bridge.readNotes(ctx.cwd, config, ctx.signal);
+		setLiveSession(notes.live);
+		if (ctx.mode !== "tui") {
+			ctx.ui.notify(notes.live ? `${notes.comments.length} user note(s).` : notes.message, notes.live ? "info" : "warning");
+			return;
+		}
+		let theme = ctx.ui.theme;
+		await ctx.ui.custom<void>((tui, nextTheme, _kb, done) => {
+			theme = nextTheme;
+			const lines = bridge.renderReviewLines(notes, findRecent, ctx.cwd, theme);
+			return {
+				render(width: number): string[] {
+					return lines.map((line) => (line.length > width ? line.slice(0, Math.max(0, width - 1)) + "…" : line));
+				},
+				invalidate() {},
+				handleInput(data: string) {
+					if (data === "\x1b" || data === "\r" || data === "q") done();
+					tui.requestRender();
+				},
+			};
+		});
+		return;
+	}
+	ctx.ui.notify(`Unknown /huff command: ${sub}. Try /huff status, /huff send, /huff auto on|off, /huff review, or /huff configure.`, "warning");
 }
 
 // ============================================================================
@@ -164,7 +189,7 @@ export default async function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("huff", {
-		description: "Huff diff renderer and read-only Hunk review bridge (/huff status, /huff send, /huff auto on|off, /huff configure)",
+		description: "Huff diff renderer and read-only Hunk review bridge (/huff status, /huff send, /huff auto on|off, /huff review, /huff configure)",
 		handler: async (args, ctx) => {
 			const [sub] = args.trim().split(/\s+/).filter(Boolean);
 			if (sub === "configure") {
@@ -188,6 +213,7 @@ export default async function (pi: ExtensionAPI) {
 				(live) => (liveHunkSession = live),
 				() => bridge.resetSignature(),
 				() => records.recentCount(),
+				(filePath, cwd) => records.findRecent(filePath, cwd),
 				bridge,
 			);
 		},
