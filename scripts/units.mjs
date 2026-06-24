@@ -38,8 +38,45 @@ const jiti = createJiti(import.meta.url, {
 	},
 });
 
-const { parseUnifiedPatch } = await jiti.import(path.join(repoRoot, "src", "diff-view.ts"), { default: false });
+const { parseUnifiedPatch, renderDiffLines } = await jiti.import(path.join(repoRoot, "src", "diff-view.ts"), { default: false });
+const { DEFAULT_CONFIG } = await jiti.import(path.join(repoRoot, "src", "config.ts"), { default: false });
 const { normalizeHunkComments } = await jiti.import(path.join(repoRoot, "src", "hunk-bridge.ts"), { default: false });
+
+function fakeTheme() {
+	const colors = {
+		accent: "\x1b[38;2;255;190;106m",
+		toolTitle: "\x1b[38;2;250;250;250m",
+		toolDiffAdded: "\x1b[38;2;80;220;120m",
+		toolDiffRemoved: "\x1b[38;2;240;100;100m",
+		toolDiffContext: "\x1b[38;2;210;210;210m",
+		muted: "\x1b[38;2;160;160;160m",
+		dim: "\x1b[38;2;110;110;110m",
+		warning: "\x1b[38;2;255;200;80m",
+		error: "\x1b[38;2;255;100;100m",
+	};
+	return {
+		name: "unit-dark",
+		fg(name, text) {
+			return `${colors[name] ?? ""}${text}\x1b[0m`;
+		},
+		getFgAnsi(name) {
+			return colors[name] ?? "";
+		},
+		bold(text) {
+			return `\x1b[1m${text}\x1b[22m`;
+		},
+	};
+}
+
+const fakeHighlighter = {
+	codeToTokensBase(line) {
+		return [[{ content: line, color: "#ffffff" }]];
+	},
+};
+
+function stripAnsi(value) {
+	return value.replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, "");
+}
 
 // --- parseUnifiedPatch: structure, line numbers, kinds ---------------------
 const patch = [
@@ -75,6 +112,25 @@ assert.ok(removeEmph, "emphasized range starts past the shared prefix");
 // trailing blank split row must not become a phantom context line
 const trailingBlank = parseUnifiedPatch(patch + "\n");
 assert.equal(trailingBlank.hunks[0].lines.length, hunk.lines.length, "no phantom trailing line");
+
+// strike word highlighting is side-aware: deletions strike, additions underline
+const strikeRender = renderDiffLines({
+	patch,
+	filePath: "a.ts",
+	cwd: repoRoot,
+	title: "unit",
+	config: { ...DEFAULT_CONFIG, wordHighlight: "strike", lineHighlight: "tint" },
+	highlighter: fakeHighlighter,
+	theme: fakeTheme(),
+	liveSession: false,
+});
+const removedRendered = strikeRender.find((line) => stripAnsi(line).includes("hello"));
+const addedRendered = strikeRender.find((line) => stripAnsi(line).includes("hi"));
+assert.match(removedRendered, /\x1b\[1;9m/, "removed words use strikethrough");
+assert.doesNotMatch(addedRendered, /\x1b\[1;9m/, "added words are not struck through");
+assert.match(addedRendered, /\x1b\[1;4m/, "added words use underline in strike mode");
+const tintRepeats = (addedRendered.match(/\x1b\[48;2;26;44;28m/g) ?? []).length;
+assert.ok(tintRepeats > 2, "tint background survives token resets across the line");
 
 // --- normalizeHunkComments: shape tolerance, dedup, type filter ------------
 const flat = normalizeHunkComments({

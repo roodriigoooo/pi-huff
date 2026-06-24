@@ -103,7 +103,7 @@ export const WORD_HIGHLIGHT_VALUES: WordHighlight[] = ["bold", "none", "underlin
 export const LINE_HIGHLIGHT_VALUES: LineHighlight[] = ["gutter", "bar", "tint", "none"];
 export const HEADER_VALUES: HeaderStyle[] = ["box", "compact", "minimal"];
 export const LINE_NUMBERS_VALUES: string[] = ["true", "false", "changed"];
-export const COLOR_VALUES: string[] = ["auto", "green", "red", "gray", "dim", "muted", "accent", "title", "warning"];
+export const COLOR_VALUES: string[] = ["auto", "green", "red", "gray", "dim", "muted", "accent", "title", "warning", "error"];
 export const BOOL_VALUES: string[] = ["true", "false"];
 
 export const DEFAULT_CONFIG: HuffConfig = {

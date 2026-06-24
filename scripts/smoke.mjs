@@ -166,12 +166,20 @@ process.exit(2);
 
 	const notifications = [];
 	const statuses = new Map();
+	const configureSnapshots = [];
 	const ui = {
 		notify: (message, type = "info") => notifications.push({ message, type }),
 		setStatus: (key, text) => statuses.set(key, text),
 		custom: async (factory) => {
 			const comp = factory({ requestRender() {} }, fakeTheme(), {}, () => {});
-			if (comp && typeof comp.render === "function") comp.render(100);
+			if (comp && typeof comp.render === "function") {
+				configureSnapshots.push(stripAnsi(comp.render(100).join("\n")));
+				comp.handleInput?.("\r");
+				configureSnapshots.push(stripAnsi(comp.render(100).join("\n")));
+				comp.handleInput?.("\x1b[B");
+				configureSnapshots.push(stripAnsi(comp.render(100).join("\n")));
+				comp.handleInput?.("\x1b");
+			}
 			return undefined;
 		},
 		theme: fakeTheme(),
@@ -301,6 +309,7 @@ process.exit(2);
 	assert.equal(finalFile, await readFile(path.join(tmp, "smoke.ts"), "utf8"), "hello huff\n");
 
 	await commands.get("huff").handler("configure", ctx);
+	assert.ok(configureSnapshots.some((snapshot) => /↑↓ move · Enter select/.test(snapshot)), "configure enter opens a picker instead of cycling");
 
 	console.log("pi-huff smoke ok");
 } finally {

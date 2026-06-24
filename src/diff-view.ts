@@ -195,7 +195,7 @@ function wordHighlightAnsi(style: WordHighlight, side: DiffSide, theme: Theme): 
 	if (style === "bold") return "\x1b[1m";
 	if (style === "underline") return "\x1b[1;4m";
 	if (style === "inverse") return "\x1b[1;7m";
-	if (style === "strike") return "\x1b[1;9m";
+	if (style === "strike") return side === "remove" ? "\x1b[1;9m" : "\x1b[1;4m";
 	if (style === "color") return side === "add" ? theme.getFgAnsi("accent") || "" : theme.getFgAnsi("warning") || theme.getFgAnsi("error") || "";
 	return "";
 }
@@ -343,8 +343,8 @@ export function renderDiffLines(input: DiffViewInput): string[] {
 			}
 			const nums = lineNoMode ? lineNoText(item, palette, lineNoMode) + " " : "";
 			const ranges = config.wordHighlight !== "none" ? (item.kind === "add" ? item.addRanges ?? [] : item.kind === "remove" ? item.removeRanges ?? [] : []) : [];
-			let code = renderCodeLine(item.text, lang, shikiTheme, highlighter, theme, config, side, ranges, sideAnsi);
-			if (changed && config.lineHighlight === "tint") code = `${tintBgAnsi(side)}${code}${ANSI_RESET}`;
+			const lineAnsi = changed && config.lineHighlight === "tint" ? `${tintBgAnsi(side)}${sideAnsi}` : sideAnsi;
+			const code = renderCodeLine(item.text, lang, shikiTheme, highlighter, theme, config, side, ranges, lineAnsi);
 			lines.push(`${marker} ${nums}${signStyled} ${code}`);
 			rendered++;
 		}

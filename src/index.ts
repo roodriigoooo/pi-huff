@@ -175,7 +175,7 @@ export default async function (pi: ExtensionAPI) {
 						config = nextConfig;
 						await rebuildHighlighter(nextConfig);
 					},
-					() => highlighter,
+					(nextConfig, invalidate) => kickHighlighter(nextConfig, invalidate),
 				);
 				return;
 			}
