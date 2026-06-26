@@ -2,10 +2,13 @@ import type { Theme } from "@earendil-works/pi-coding-agent";
 import { bundledThemesInfo } from "shiki";
 import {
 	BOOL_VALUES,
+	DEFAULT_COLORS,
+	DEFAULT_SYMBOLS,
 	HEADER_VALUES,
 	type HunkConfig,
 	LINE_HIGHLIGHT_VALUES,
 	LINE_NUMBERS_VALUES,
+	mergeConfig,
 	resolveColorAnsi,
 	type ColorSlots,
 	type SymbolSlots,
@@ -34,6 +37,7 @@ const COLOR_FALLBACKS: Record<keyof ColorSlots, string> = {
 };
 
 export type Choice = { value: string; label?: string; description?: string };
+export type HunkPreset = { id: string; label: string; description: string; config: Partial<HunkConfig> };
 type ChoiceFactory = (config: HunkConfig, theme: Theme) => Choice[];
 
 export type ConfigSpec = {
@@ -103,7 +107,7 @@ function symbolSpec(id: string, label: string, slot: keyof SymbolSlots): ConfigS
 	return {
 		id,
 		label,
-		values: SYMBOL_PRESETS[slot],
+		choices: (_config, theme) => symbolChoices(slot, theme),
 		get: (c) => c.symbols[slot],
 		set: (c, v) => (c.symbols[slot] = v),
 		describe: () => `Cycles glyphs used for ${slot} rows.`,
@@ -152,9 +156,25 @@ function shikiThemeChoices(type: "dark" | "light"): Choice[] {
 		.map((info) => ({ value: info.id, label: `${info.displayName} · ${info.id}`, description: `Bundled Shiki ${type} theme.` }));
 }
 
-function swatch(ref: string, fallbackSlot: string, theme: Theme, label: string): string {
+function colorSample(ref: string, fallbackSlot: string, theme: Theme, label: string): string {
 	const ansi = resolveColorAnsi(ref, fallbackSlot, theme) || theme.getFgAnsi("muted") || "";
-	return `${ansi}●${ANSI_RESET} ${label}`;
+	return `${ansi}+ const tone = vivid${ANSI_RESET} ${theme.fg("dim", "·")} ${label}`;
+}
+
+function symbolSample(slot: keyof SymbolSlots, value: string, theme: Theme): string {
+	if (slot === "fold") return `${theme.fg("dim", `  ${value} 3 unchanged lines`)}`;
+	const gutter = slot === "gutter" ? value : "▎";
+	const sign = slot === "add" ? value : slot === "remove" ? value : slot === "context" ? value : "+";
+	const code = sign.trim() ? "const x = 1;" : "const stable = true;";
+	return `${theme.fg("muted", gutter)} ${theme.fg("accent", sign)}   ${code}`;
+}
+
+function symbolChoices(slot: keyof SymbolSlots, theme: Theme): Choice[] {
+	return SYMBOL_PRESETS[slot].map((value) => ({
+		value,
+		label: symbolSample(slot, value, theme),
+		description: `Render ${value === " " ? "blank space" : value} in a representative diff row.`,
+	}));
 }
 
 /** Per-slot color choices: auto (follow role) + six UI-semantic colors + freeform hex.
@@ -172,8 +192,8 @@ function colorChoices(slot: keyof ColorSlots, theme: Theme): Choice[] {
 		["error", "Error/red emphasis."],
 	];
 	return [
-		{ value: "auto", label: swatch("auto", fallback, theme, "auto"), description: autoDescription },
-		...semantic.map(([value, description]) => ({ value, label: swatch(value, fallback, theme, value), description })),
+		{ value: "auto", label: colorSample("auto", fallback, theme, "auto"), description: autoDescription },
+		...semantic.map(([value, description]) => ({ value, label: colorSample(value, fallback, theme, value), description })),
 	];
 }
 
@@ -203,6 +223,81 @@ export function descriptionForSpec(spec: ConfigSpec, config: HunkConfig, theme: 
 	const value = spec.get(config);
 	const detail = spec.describe?.(value, config, theme) ?? choiceDescription(choicesForSpec(spec, config, theme), value);
 	return detail ? `Current: ${value} — ${detail}` : `Current: ${value}`;
+}
+
+export function hunkConfigPresets(): HunkPreset[] {
+	return [
+		{
+			id: "pi-native",
+			label: "pi native",
+			description: "Follow pi theme slots, bold changed words, gutter rail, boxed header.",
+			config: {
+				enabled: true,
+				diffTheme: "auto",
+				lineNumbers: true,
+				compactUnchanged: true,
+				contextRadius: 6,
+				maxRenderedLines: 260,
+				wordHighlight: "bold",
+				lineHighlight: "gutter",
+				header: "box",
+				colors: { ...DEFAULT_COLORS },
+				symbols: { ...DEFAULT_SYMBOLS },
+			},
+		},
+		{
+			id: "high-contrast-mono",
+			label: "high-contrast mono",
+			description: "Neutral side colors, inverse words, structural bar, minimal header.",
+			config: {
+				enabled: true,
+				lineNumbers: "changed",
+				compactUnchanged: true,
+				contextRadius: 3,
+				wordHighlight: "inverse",
+				lineHighlight: "bar",
+				header: "minimal",
+				colors: { add: "muted", remove: "muted", context: "dim", meta: "dim", header: "title", gutter: "accent", lineNo: "dim" },
+				symbols: { ...DEFAULT_SYMBOLS, gutter: "│" },
+			},
+		},
+		{
+			id: "warm-editorial",
+			label: "warm editorial",
+			description: "Soft truecolor sides, underlined words, quiet gutter, compact header.",
+			config: {
+				enabled: true,
+				lineNumbers: true,
+				compactUnchanged: true,
+				contextRadius: 6,
+				wordHighlight: "underline",
+				lineHighlight: "gutter",
+				header: "compact",
+				colors: { add: "#80dc78", remove: "#ff6b6b", context: "muted", meta: "dim", header: "title", gutter: "auto", lineNo: "dim" },
+				symbols: { ...DEFAULT_SYMBOLS },
+			},
+		},
+		{
+			id: "syntax-only",
+			label: "syntax-only",
+			description: "No word or line markers; Shiki syntax and compact chrome carry the view.",
+			config: {
+				enabled: true,
+				lineNumbers: true,
+				compactUnchanged: true,
+				contextRadius: 6,
+				wordHighlight: "none",
+				lineHighlight: "none",
+				header: "compact",
+				colors: { ...DEFAULT_COLORS },
+				symbols: { ...DEFAULT_SYMBOLS },
+			},
+		},
+	];
+}
+
+export function applyHunkPreset(base: HunkConfig, preset: HunkPreset): HunkConfig {
+	return mergeConfig(base, preset.config);
 }
 
 /** All config specs grouped by what the user sees, not by config key. */

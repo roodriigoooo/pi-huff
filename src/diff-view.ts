@@ -10,6 +10,8 @@ import {
 	gutterColor,
 	resolvePalette,
 	tintBgAnsi,
+	TOKENIZE_MAX_LINE_LENGTH,
+	TOKENIZE_TIME_LIMIT_MS,
 	type WordHighlight,
 } from "./config";
 import { displayPath, fileKey } from "./paths";
@@ -241,6 +243,56 @@ function filteredHunkLines(hunk: ParsedHunk, config: HunkConfig, hunkIndex = 0, 
 
 type ShikiTokenLine = ReturnType<Highlighter["codeToTokensBase"]>[number];
 
+const lazyLanguageLoads = new WeakMap<Highlighter, Set<string>>();
+const lazyLanguageFailures = new WeakMap<Highlighter, Set<string>>();
+
+function isSpecialLanguage(lang: string): boolean {
+	return lang === "text" || lang === "plain" || lang === "ansi";
+}
+
+function loadedLanguageName(highlighter: Highlighter, lang: string): string | undefined {
+	if (isSpecialLanguage(lang)) return lang;
+	const loaded = typeof highlighter.getLoadedLanguages === "function" ? highlighter.getLoadedLanguages() : undefined;
+	if (!loaded) return lang;
+	if (loaded.includes(lang)) return lang;
+	try {
+		const resolved = highlighter.resolveLangAlias(lang);
+		return loaded.includes(resolved) ? resolved : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function scheduleLazyLanguageLoad(highlighter: Highlighter, lang: string, invalidate?: () => void): void {
+	if (isSpecialLanguage(lang) || typeof highlighter.loadLanguage !== "function") return;
+	if (loadedLanguageName(highlighter, lang)) return;
+	let failed = lazyLanguageFailures.get(highlighter);
+	if (failed?.has(lang)) return;
+	let loading = lazyLanguageLoads.get(highlighter);
+	if (!loading) {
+		loading = new Set();
+		lazyLanguageLoads.set(highlighter, loading);
+	}
+	if (loading.has(lang)) return;
+	loading.add(lang);
+	void highlighter
+		.loadLanguage(lang)
+		.then(() => invalidate?.())
+		.catch(() => {
+			failed = lazyLanguageFailures.get(highlighter);
+			if (!failed) {
+				failed = new Set();
+				lazyLanguageFailures.set(highlighter, failed);
+			}
+			failed.add(lang);
+		})
+		.finally(() => loading?.delete(lang));
+}
+
+function hunkHasTooLongLine(hunk: ParsedHunk): boolean {
+	return hunk.lines.some((line) => line.text.length > TOKENIZE_MAX_LINE_LENGTH);
+}
+
 /** Tokenize each side of a hunk as one string so multi-line constructs (template
  *  literals, block comments, JSX, triple-quoted strings) keep their grammar
  *  state across continuation lines. Returns undefined when there is no
@@ -250,8 +302,14 @@ function tokenizeHunkSides(
 	highlighter: Highlighter | undefined,
 	lang: string,
 	shikiTheme: string,
+	invalidate?: () => void,
 ): { oldTokens: ShikiTokenLine[]; newTokens: ShikiTokenLine[] } | undefined {
 	if (!highlighter) return undefined;
+	if (hunkHasTooLongLine(hunk)) return undefined;
+	if (!loadedLanguageName(highlighter, lang)) {
+		scheduleLazyLanguageLoad(highlighter, lang, invalidate);
+		return undefined;
+	}
 	try {
 		const oldLines: string[] = [];
 		const newLines: string[] = [];
@@ -265,8 +323,9 @@ function tokenizeHunkSides(
 				newLines.push(line.text);
 			}
 		}
-		const oldTokens = highlighter.codeToTokensBase(oldLines.join("\n") || " ", { lang, theme: shikiTheme });
-		const newTokens = highlighter.codeToTokensBase(newLines.join("\n") || " ", { lang, theme: shikiTheme });
+		const tokenOptions = { lang, theme: shikiTheme, tokenizeMaxLineLength: TOKENIZE_MAX_LINE_LENGTH, tokenizeTimeLimit: TOKENIZE_TIME_LIMIT_MS };
+		const oldTokens = highlighter.codeToTokensBase(oldLines.join("\n") || " ", tokenOptions);
+		const newTokens = highlighter.codeToTokensBase(newLines.join("\n") || " ", tokenOptions);
 		return { oldTokens, newTokens };
 	} catch {
 		return undefined;
@@ -400,10 +459,11 @@ export type DiffViewInput = {
 	theme: Theme;
 	liveSession?: boolean;
 	annotations?: DiffLineAnnotations;
+	invalidate?: () => void;
 };
 
 export function renderDiffLines(input: DiffViewInput): string[] {
-	const { patch, filePath, cwd, title, config, highlighter, theme, liveSession, annotations } = input;
+	const { patch, filePath, cwd, title, config, highlighter, theme, liveSession, annotations, invalidate } = input;
 	const parsed = parseUnifiedPatch(patch);
 	const stats = countStats(parsed);
 	const lang = getLanguageFromPath(filePath) ?? "text";
@@ -438,7 +498,7 @@ export function renderDiffLines(input: DiffViewInput): string[] {
 			truncated = true;
 			break;
 		}
-		const sides = tokenizeHunkSides(hunk, highlighter, lang, shikiTheme);
+		const sides = tokenizeHunkSides(hunk, highlighter, lang, shikiTheme, invalidate);
 		lines.push(hunkCaption(hunk, filePath, cwd, theme));
 		rendered++;
 		for (const item of filteredHunkLines(hunk, config, hunkIndex, annotatedLineKeys)) {

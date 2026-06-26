@@ -298,7 +298,7 @@ export default async function (pi: ExtensionAPI) {
 			const filePath = record?.filePath ?? resolveUserPath(context.args.path, context.cwd);
 			if (!config.enabled || !patch) return new Text(details?.diff ?? "Edited file", 0, 0);
 			const activeHighlighter = highlighters.get(config, context.invalidate);
-			return createDiffView({ patch, filePath, cwd: context.cwd, title: "edited", config, highlighter: activeHighlighter, theme, liveSession: liveHunkSession });
+			return createDiffView({ patch, filePath, cwd: context.cwd, title: "edited", config, highlighter: activeHighlighter, theme, liveSession: liveHunkSession, invalidate: context.invalidate });
 		},
 	});
 
@@ -357,6 +357,7 @@ export default async function (pi: ExtensionAPI) {
 				highlighter: activeHighlighter,
 				theme,
 				liveSession: liveHunkSession,
+				invalidate: context.invalidate,
 			});
 		},
 	});

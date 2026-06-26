@@ -14,8 +14,11 @@ import {
 import fs from "node:fs/promises";
 import path from "node:path";
 import { type HunkConfig } from "./config";
-import { choicesForSpec, descriptionForSpec, hunkConfigGroups, isHexColor, normalizeHex, type Choice } from "./config-spec";
+import { applyHunkPreset, choicesForSpec, descriptionForSpec, hunkConfigGroups, hunkConfigPresets, isHexColor, normalizeHex, type Choice, type HunkPreset } from "./config-spec";
 import { type Highlighter, createDiffView } from "./diff-view";
+
+const CONFIGURE_LIST_ROWS = 6;
+const CONFIGURE_PREVIEW_MAX_LINES = 14;
 
 const HUNK_CONFIG_SAMPLE_PATCH = [
 	"--- a/preview.ts",
@@ -115,7 +118,7 @@ class ChoicePicker implements Component {
 		private readonly onPreview: (value: string) => void,
 	) {
 		const items: SelectItem[] = choices.map((choice) => ({ value: choice.value, label: choice.label ?? choice.value, description: choice.description }));
-		this.list = new SelectList(items, Math.min(items.length, 8), selectListThemeFromUi(theme), { minPrimaryColumnWidth: 28, maxPrimaryColumnWidth: 42 });
+		this.list = new SelectList(items, Math.min(items.length, CONFIGURE_LIST_ROWS), selectListThemeFromUi(theme), { minPrimaryColumnWidth: 28, maxPrimaryColumnWidth: 52 });
 		const selected = choices.findIndex((choice) => choice.value === originalValue);
 		this.list.setSelectedIndex(selected === -1 ? 0 : selected);
 		this.list.onSelectionChange = (item) => this.onPreview(item.value);
@@ -199,9 +202,9 @@ class ChoicePicker implements Component {
 	}
 }
 
-/** Open the `/hunk configure` live-preview TUI. Two-level nav: group list →
- *  per-group settings. Esc inside a group returns to the group list; Esc on the
- *  group list saves to `.pi/hunk.json` and closes. */
+/** Open the `/hunk configure` live-preview TUI. Presets are the primary
+ *  surface; Advanced opens the per-group settings editor. Esc saves to
+ *  `.pi/hunk.json` from either top-level surface. */
 export async function openHunkConfig(
 	ctx: ExtensionCommandContext,
 	getConfig: () => HunkConfig,
@@ -212,28 +215,40 @@ export async function openHunkConfig(
 		ctx.ui.notify("/hunk configure requires TUI mode.", "error");
 		return;
 	}
-	const draft = cloneConfig(getConfig());
+	let draft = cloneConfig(getConfig());
+	let previewDraft = cloneConfig(draft);
+	const presets = hunkConfigPresets();
 	const groups = hunkConfigGroups();
 	let theme = ctx.ui.theme;
 	let requestPreviewRender: (() => void) | undefined;
 	let closeDone: ((value?: void) => void) | undefined;
+	let mode: "presets" | "advanced" = "presets";
+	let currentGroup = -1;
+	let groupLists: SettingsList[] = [];
+
+	function previewConfig(): HunkConfig {
+		return previewDraft;
+	}
 
 	function buildPreview(): Component {
-		if (!draft.enabled) {
+		const config = previewConfig();
+		if (!config.enabled) {
 			return new StaticLines(() => [
 				theme.fg("muted", "pi-hunk renderer disabled."),
 				theme.fg("dim", "Pi will use default tool rendering until enabled again."),
 			]);
 		}
+		const capped = { ...config, maxRenderedLines: Math.min(config.maxRenderedLines, CONFIGURE_PREVIEW_MAX_LINES) };
 		return createDiffView({
 			patch: HUNK_CONFIG_SAMPLE_PATCH,
 			filePath: "preview.ts",
 			cwd: ctx.cwd,
 			title: "preview",
-			config: draft,
-			highlighter: getHighlighter(draft, requestPreviewRender),
+			config: capped,
+			highlighter: getHighlighter(capped, requestPreviewRender),
 			theme,
 			liveSession: true,
+			invalidate: requestPreviewRender,
 		});
 	}
 
@@ -242,67 +257,109 @@ export async function openHunkConfig(
 		preview = buildPreview();
 	}
 
+	function saveAndClose() {
+		saveProjectHunkConfig(ctx.cwd, draft)
+			.then(() => applyConfig(draft))
+			.then(() => ctx.ui.notify("Saved Hunk config to .pi/hunk.json.", "info"))
+			.catch((error) => ctx.ui.notify(`Failed to save Hunk config: ${String(error)}`, "error"))
+			.finally(() => closeDone?.());
+	}
+
+	function previewPreset(preset: HunkPreset | undefined) {
+		previewDraft = preset ? applyHunkPreset(draft, preset) : cloneConfig(draft);
+		rebuildPreview();
+	}
+
+	function applyPreset(preset: HunkPreset) {
+		draft = applyHunkPreset(draft, preset);
+		previewDraft = cloneConfig(draft);
+		groupLists = buildGroupLists();
+		rebuildPreview();
+	}
+
+	const presetItems: SelectItem[] = [
+		...presets.map((preset) => ({ value: `preset:${preset.id}`, label: preset.label, description: preset.description })),
+		{ value: "advanced", label: "Advanced", description: "Edit every group and slot on top of the chosen preset." },
+	];
+	const presetNav = new SelectList(presetItems, Math.min(presetItems.length, CONFIGURE_LIST_ROWS), selectListThemeFromUi(theme), { minPrimaryColumnWidth: 24, maxPrimaryColumnWidth: 32 });
+	presetNav.onSelectionChange = (item) => previewPreset(presets.find((preset) => item.value === `preset:${preset.id}`));
+	presetNav.onSelect = (item) => {
+		const preset = presets.find((candidate) => item.value === `preset:${candidate.id}`);
+		if (preset) {
+			applyPreset(preset);
+			ctx.ui.notify(`Applied Hunk preset: ${preset.label}.`, "info");
+			return;
+		}
+		mode = "advanced";
+		currentGroup = -1;
+		previewDraft = cloneConfig(draft);
+		rebuildPreview();
+	};
+	presetNav.onCancel = saveAndClose;
+
 	const settingsTheme = resolveSettingsListTheme(theme);
-
-	let currentGroup = -1;
-
 	const groupNav = new SelectList(
 		groups.map((g, i) => ({ value: String(i), label: g.label, description: g.description })),
-		Math.min(groups.length, 8),
+		Math.min(groups.length, CONFIGURE_LIST_ROWS),
 		selectListThemeFromUi(theme),
 	);
 	groupNav.onSelect = (item) => {
 		currentGroup = Number(item.value);
 	};
 	groupNav.onCancel = () => {
-		saveProjectHunkConfig(ctx.cwd, draft)
-			.then(() => applyConfig(draft))
-			.then(() => ctx.ui.notify("Saved Hunk config to .pi/hunk.json.", "info"))
-			.catch((error) => ctx.ui.notify(`Failed to save Hunk config: ${String(error)}`, "error"))
-			.finally(() => closeDone?.());
+		mode = "presets";
+		currentGroup = -1;
+		previewDraft = cloneConfig(draft);
+		rebuildPreview();
 	};
 
-	const groupLists = groups.map((group) => {
-		const items: SettingItem[] = group.specs.map((spec) => {
-			const item: SettingItem = {
-				id: spec.id,
-				label: spec.label,
-				currentValue: spec.get(draft),
-				description: descriptionForSpec(spec, draft, theme),
-			};
-			item.submenu = (currentValue, done) =>
-				new ChoicePicker(spec.label, choicesForSpec(spec, draft, theme), theme, done, currentValue, spec.id.startsWith("colors."), (value) => {
-					spec.set(draft, value);
-					item.currentValue = spec.get(draft);
-					item.description = descriptionForSpec(spec, draft, theme);
+	function buildGroupLists(): SettingsList[] {
+		return groups.map((group) => {
+			const items: SettingItem[] = group.specs.map((spec) => {
+				const item: SettingItem = {
+					id: spec.id,
+					label: spec.label,
+					currentValue: spec.get(draft),
+					description: descriptionForSpec(spec, draft, theme),
+				};
+				item.submenu = (currentValue, done) =>
+					new ChoicePicker(spec.label, choicesForSpec(spec, draft, theme), theme, done, currentValue, spec.id.startsWith("colors."), (value) => {
+						spec.set(draft, value);
+						previewDraft = cloneConfig(draft);
+						item.currentValue = spec.get(draft);
+						item.description = descriptionForSpec(spec, draft, theme);
+						rebuildPreview();
+					});
+				return item;
+			});
+			return new SettingsList(
+				items,
+				Math.min(items.length, CONFIGURE_LIST_ROWS),
+				settingsTheme,
+				(id, newValue) => {
+					const spec = group.specs.find((s) => s.id === id);
+					if (!spec) return;
+					spec.set(draft, newValue);
+					previewDraft = cloneConfig(draft);
+					const item = items.find((i) => i.id === id);
+					if (item) {
+						item.currentValue = spec.get(draft);
+						item.description = descriptionForSpec(spec, draft, theme);
+					}
 					rebuildPreview();
-				});
-			return item;
+				},
+				() => {
+					currentGroup = -1;
+				},
+				{ enableSearch: true },
+			);
 		});
-		return new SettingsList(
-			items,
-			Math.min(items.length, 8),
-			settingsTheme,
-			(id, newValue) => {
-				const spec = group.specs.find((s) => s.id === id);
-				if (!spec) return;
-				spec.set(draft, newValue);
-				const item = items.find((i) => i.id === id);
-				if (item) {
-					item.currentValue = spec.get(draft);
-					item.description = descriptionForSpec(spec, draft, theme);
-				}
-				rebuildPreview();
-			},
-			() => {
-				currentGroup = -1;
-			},
-			{ enableSearch: true },
-		);
-	});
+	}
+	groupLists = buildGroupLists();
 
 	await ctx.ui.custom<void>((tui, nextTheme, _kb, done) => {
 		theme = nextTheme;
+		let renderedRows = 0;
 		requestPreviewRender = () => {
 			rebuildPreview();
 			preview.invalidate();
@@ -312,14 +369,18 @@ export async function openHunkConfig(
 		return {
 			render(width: number): string[] {
 				const out: string[] = [];
-				out.push(`${theme.fg("accent", theme.bold("Hunk Configuration"))} ${theme.fg("dim", "· live Shiki preview")}`);
-				if (currentGroup === -1) {
-					out.push(theme.fg("dim", "Enter opens group · Esc saves & closes"));
+				out.push(`${theme.fg("accent", theme.bold("Hunk Configuration"))} ${theme.fg("dim", "· presets + live Shiki preview")}`);
+				if (mode === "presets") {
+					out.push(theme.fg("dim", "↑↓ preview preset · Enter apply/open Advanced · Esc saves & closes"));
+				} else if (currentGroup === -1) {
+					out.push(theme.fg("dim", "Advanced · Enter opens group · Esc back to presets"));
 				} else {
 					out.push(`${theme.fg("dim", "Esc back to groups")} ${theme.fg("dim", "·")} ${theme.fg("muted", groups[currentGroup].label)}`);
 				}
 				out.push("");
-				if (currentGroup === -1) {
+				if (mode === "presets") {
+					out.push(...presetNav.render(width));
+				} else if (currentGroup === -1) {
 					out.push(...groupNav.render(width));
 				} else {
 					out.push(...groupLists[currentGroup].render(width));
@@ -327,15 +388,20 @@ export async function openHunkConfig(
 				out.push("");
 				out.push(`${theme.fg("accent", "✦")} ${theme.fg("toolTitle", theme.bold("Preview"))}`);
 				out.push(...preview.render(Math.max(40, width)));
-				return out;
+				renderedRows = Math.max(renderedRows, out.length);
+				while (out.length < renderedRows) out.push(" ".repeat(Math.max(0, width)));
+				return out.map((line) => truncateToWidth(line, width));
 			},
 			invalidate() {
+				presetNav.invalidate();
 				groupNav.invalidate();
 				groupLists.forEach((g) => g.invalidate());
 				preview.invalidate();
 			},
 			handleInput(data: string) {
-				if (currentGroup === -1) {
+				if (mode === "presets") {
+					presetNav.handleInput(data);
+				} else if (currentGroup === -1) {
 					groupNav.handleInput(data);
 				} else {
 					groupLists[currentGroup].handleInput(data);

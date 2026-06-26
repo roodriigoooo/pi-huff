@@ -172,16 +172,18 @@ process.exit(2);
 		setStatus: (key, text) => statuses.set(key, text),
 		custom: async (factory) => {
 			const comp = factory({ requestRender() {} }, fakeTheme(), {}, () => {});
-		if (comp && typeof comp.render === "function") {
-			configureSnapshots.push(stripAnsi(comp.render(100).join("\n")));
-			comp.handleInput?.("\r");
-			configureSnapshots.push(stripAnsi(comp.render(100).join("\n")));
-			comp.handleInput?.("\r");
-			configureSnapshots.push(stripAnsi(comp.render(100).join("\n")));
-			comp.handleInput?.("\x1b[B");
-			configureSnapshots.push(stripAnsi(comp.render(100).join("\n")));
-			comp.handleInput?.("\x1b");
-		}
+			if (comp && typeof comp.render === "function") {
+				configureSnapshots.push(stripAnsi(comp.render(100).join("\n")));
+				for (let i = 0; i < 4; i++) comp.handleInput?.("\x1b[B");
+				configureSnapshots.push(stripAnsi(comp.render(100).join("\n")));
+				comp.handleInput?.("\r");
+				configureSnapshots.push(stripAnsi(comp.render(100).join("\n")));
+				comp.handleInput?.("\r");
+				configureSnapshots.push(stripAnsi(comp.render(100).join("\n")));
+				comp.handleInput?.("\r");
+				configureSnapshots.push(stripAnsi(comp.render(100).join("\n")));
+				comp.handleInput?.("\x1b");
+			}
 			return undefined;
 		},
 		theme: fakeTheme(),
@@ -333,9 +335,11 @@ process.exit(2);
 	await hunkCommand.handler("configure", ctx);
 	const cfgSnapshots = configureSnapshots.slice(configureStart);
 	assert.ok(cfgSnapshots[0].includes("Hunk Configuration"), "configure opens with title");
-	assert.ok(cfgSnapshots[0].includes("Side colors & words"), "configure shows group nav");
+	assert.ok(cfgSnapshots[0].includes("pi native"), "configure opens with preset nav");
+	assert.ok(cfgSnapshots.some((s) => s.includes("Advanced")), "configure exposes Advanced path");
+	assert.ok(cfgSnapshots.some((s) => s.includes("Side colors & words")), "advanced path shows group nav");
 	assert.ok(cfgSnapshots.some((s) => s.includes("word emphasis")), "enter descends into a group showing its settings");
-	assert.ok(cfgSnapshots.some((snapshot) => /↑↓ move · Enter select/.test(snapshot)), "second enter opens a picker inside the group");
+	assert.ok(cfgSnapshots.some((snapshot) => /↑↓ move · Enter select/.test(snapshot)), "third enter opens a picker inside the group");
 
 	console.log("pi-hunk smoke ok");
 } finally {

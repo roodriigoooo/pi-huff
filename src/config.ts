@@ -100,6 +100,9 @@ export const DEFAULT_SYMBOLS: SymbolSlots = {
 	gutter: "▎",
 };
 
+export const TOKENIZE_MAX_LINE_LENGTH = 2000;
+export const TOKENIZE_TIME_LIMIT_MS = 500;
+
 export const WORD_HIGHLIGHT_VALUES: WordHighlight[] = ["bold", "none", "underline", "inverse", "strike", "color"];
 export const LINE_HIGHLIGHT_VALUES: LineHighlight[] = ["gutter", "bar", "tint", "none"];
 export const HEADER_VALUES: HeaderStyle[] = ["box", "compact", "minimal"];

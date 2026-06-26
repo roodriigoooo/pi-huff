@@ -29,7 +29,7 @@ You need the `hunk` CLI on your PATH only if you use the review bridge. The diff
 - `/hunk send` reads `hunk session comment list --repo <cwd> --type user --json`, shapes the open review state by file and line, and attaches it to the agent as a follow-up when idle or as steering when streaming.
 - `/hunk on|off` opts in/out of automatic pickup before each agent turn. Pickup is scoped to notes that overlap a recent edit by file and line, and unchanged duplicate review states are not re-attached. `/hunk auto on|off` remains accepted for compatibility.
 - `/hunk review` opens a read-only view that pairs each open user note with whether a recent edit touched its line (`✓ touched`) or not (`○ open`). It never sends anything to the agent.
-- `/hunk configure` opens the configuration TUI.
+- `/hunk configure` opens the preset-first configuration TUI; Advanced keeps per-setting control.
 
 ## LLM-callable tool
 

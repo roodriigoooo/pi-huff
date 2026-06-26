@@ -40,8 +40,8 @@ const jiti = createJiti(import.meta.url, {
 });
 
 const { parseUnifiedPatch, renderDiffLines, findPatchLineAddress, patchLineAddressKey } = await jiti.import(path.join(repoRoot, "src", "diff-view.ts"), { default: false });
-const { DEFAULT_CONFIG, ansiFg } = await jiti.import(path.join(repoRoot, "src", "config.ts"), { default: false });
-const { choicesForSpec, descriptionForSpec, hunkConfigGroups } = await jiti.import(path.join(repoRoot, "src", "config-spec.ts"), { default: false });
+const { DEFAULT_CONFIG, TOKENIZE_MAX_LINE_LENGTH, TOKENIZE_TIME_LIMIT_MS, ansiFg } = await jiti.import(path.join(repoRoot, "src", "config.ts"), { default: false });
+const { applyHunkPreset, choicesForSpec, descriptionForSpec, hunkConfigGroups, hunkConfigPresets } = await jiti.import(path.join(repoRoot, "src", "config-spec.ts"), { default: false });
 const { createHighlighterCache } = await jiti.import(path.join(repoRoot, "src", "highlighter-cache.ts"), { default: false });
 const { normalizeHunkComments, createHunkBridge, buildReviewNoteShape, reviewAnnotationsForRecord } = await jiti.import(path.join(repoRoot, "src", "hunk-bridge.ts"), { default: false });
 const { createRenderRecordStore } = await jiti.import(path.join(repoRoot, "src", "render-records.ts"), { default: false });
@@ -234,6 +234,66 @@ assert.equal(altFields[0].author, "human");
 	assert.ok(worldLine.includes(expectedAnsi), `continuation line carries template-string color ${expectedAnsi}`);
 	assert.ok(!worldLine.includes(isolatedAnsi), `continuation line does not carry isolated-identifier color ${isolatedAnsi}; got: ${JSON.stringify(worldLine)}`);
 	await highlighter.dispose();
+}
+
+// --- Shiki perf guards + lazy non-core language loading --------------------
+{
+	let invalidated = false;
+	const highlighter = await createHighlighter({ themes: ["github-dark"], langs: ["typescript"] });
+	assert.ok(!highlighter.getLoadedLanguages().includes("haskell"), "haskell is not eagerly loaded");
+	const hsPatch = [
+		"--- a/Main.hs",
+		"+++ b/Main.hs",
+		"@@ -1,1 +1,1 @@",
+		"-main = putStrLn \"old\"",
+		"+main = putStrLn \"new\"",
+	].join("\n");
+	const first = renderDiffLines({
+		patch: hsPatch,
+		filePath: "Main.hs",
+		cwd: repoRoot,
+		title: "unit",
+		config: { ...DEFAULT_CONFIG, wordHighlight: "none", lineHighlight: "none", lineNumbers: false, header: "minimal", compactUnchanged: false },
+		highlighter,
+		theme: fakeTheme(),
+		liveSession: false,
+		invalidate: () => (invalidated = true),
+	});
+	assert.ok(first.some((line) => stripAnsi(line).includes("putStrLn")), "first render falls back to readable plain text");
+	for (let i = 0; i < 40 && !highlighter.getLoadedLanguages().includes("haskell"); i++) await new Promise((resolve) => setTimeout(resolve, 25));
+	assert.ok(highlighter.getLoadedLanguages().includes("haskell"), "haskell loaded lazily");
+	assert.equal(invalidated, true, "lazy load asks TUI to rerender");
+	const expected = highlighter.codeToTokensBase("main = putStrLn \"new\"", { lang: "haskell", theme: "github-dark" })[0].find((t) => t.content.includes("new"));
+	const expectedAnsi = ansiFg(expected?.color);
+	const second = renderDiffLines({
+		patch: hsPatch,
+		filePath: "Main.hs",
+		cwd: repoRoot,
+		title: "unit",
+		config: { ...DEFAULT_CONFIG, wordHighlight: "none", lineHighlight: "none", lineNumbers: false, header: "minimal", compactUnchanged: false },
+		highlighter,
+		theme: fakeTheme(),
+		liveSession: false,
+	});
+	assert.ok(expectedAnsi && second.some((line) => line.includes(expectedAnsi)), "second render uses lazily loaded Haskell grammar");
+	await highlighter.dispose();
+
+	let calls = 0;
+	const guardedHighlighter = {
+		codeToTokensBase(_code, options) {
+			calls++;
+			assert.equal(options.tokenizeMaxLineLength, TOKENIZE_MAX_LINE_LENGTH, "max line guard passed to Shiki");
+			assert.equal(options.tokenizeTimeLimit, TOKENIZE_TIME_LIMIT_MS, "time guard passed to Shiki");
+			return [[{ content: "const ok = true;", color: "#ffffff" }]];
+		},
+	};
+	const shortPatch = "--- a/a.ts\n+++ b/a.ts\n@@ -1,1 +1,1 @@\n-const ok = false;\n+const ok = true;";
+	renderDiffLines({ patch: shortPatch, filePath: "a.ts", cwd: repoRoot, title: "unit", config: { ...DEFAULT_CONFIG, compactUnchanged: false }, highlighter: guardedHighlighter, theme: fakeTheme() });
+	assert.equal(calls, 2, "normal hunk tokenizes both sides with guards");
+	const longLine = "x".repeat(TOKENIZE_MAX_LINE_LENGTH + 1);
+	const longPatch = `--- a/a.ts\n+++ b/a.ts\n@@ -1,1 +1,1 @@\n-${longLine}\n+${longLine}`;
+	renderDiffLines({ patch: longPatch, filePath: "a.ts", cwd: repoRoot, title: "unit", config: { ...DEFAULT_CONFIG, compactUnchanged: false }, highlighter: guardedHighlighter, theme: fakeTheme() });
+	assert.equal(calls, 2, "too-long hunk falls back to plain text before tokenization");
 }
 
 // --- word-emphasis indexing across astral code points (Q4) ------------------
@@ -500,6 +560,21 @@ assert.equal(altFields[0].author, "human");
 		assert.equal(spec.get(draft), next, `${spec.id} set/get round-trips`);
 		assert.match(descriptionForSpec(spec, draft, fakeTheme()), /^Current:/, `${spec.id} has description`);
 	}
+	const presets = hunkConfigPresets();
+	assert.deepEqual(presets.map((preset) => preset.id), ["pi-native", "high-contrast-mono", "warm-editorial", "syntax-only"], "preset surface is stable");
+	const warm = applyHunkPreset(JSON.parse(JSON.stringify(DEFAULT_CONFIG)), presets.find((preset) => preset.id === "warm-editorial"));
+	assert.equal(warm.wordHighlight, "underline", "preset applies word style");
+	assert.equal(warm.header, "compact", "preset applies header style");
+	assert.equal(warm.colors.add, "#80dc78", "preset applies full color config");
+	const syntaxOnly = applyHunkPreset(JSON.parse(JSON.stringify(DEFAULT_CONFIG)), presets.find((preset) => preset.id === "syntax-only"));
+	assert.equal(syntaxOnly.wordHighlight, "none", "syntax-only disables word markers");
+	assert.equal(syntaxOnly.lineHighlight, "none", "syntax-only disables line markers");
+	const gutterSpec = specs.find((spec) => spec.id === "symbols.gutter");
+	const addColorSpec = specs.find((spec) => spec.id === "colors.add");
+	const gutterChoice = choicesForSpec(gutterSpec, DEFAULT_CONFIG, fakeTheme())[0];
+	const addColorChoice = choicesForSpec(addColorSpec, DEFAULT_CONFIG, fakeTheme())[0];
+	assert.match(stripAnsi(gutterChoice.label), /\+\s+const x = 1;/, "symbol choices render glyphs inside a sample diff line");
+	assert.match(stripAnsi(addColorChoice.label), /\+ const tone = vivid/, "color choices render color inside a sample diff line");
 }
 
 console.log("pi-hunk units ok");
