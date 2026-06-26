@@ -18,7 +18,7 @@ pi install npm:@roodriigoooo/pi-hunk
 Then restart pi (or run `/reload`). To install a pinned git ref instead:
 
 ```bash
-pi install git:github.com/roodriigoooo/pi-hunk@v0.5.0
+pi install git:github.com/roodriigoooo/pi-hunk@v0.6.0
 ```
 
 You need the `hunk` CLI on your PATH only if you use the review bridge. The diff renderer works on its own.
