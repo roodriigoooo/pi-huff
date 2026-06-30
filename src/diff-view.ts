@@ -1,28 +1,24 @@
 import { getLanguageFromPath, type Theme } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth, type Component } from "@earendil-works/pi-tui";
 import { createTwoFilesPatch, diffWordsWithSpace } from "diff";
-import { type HighlighterGeneric } from "shiki";
 import {
-	ansiFg,
-	type DiffSide,
 	displayTheme,
+	type DiffSide,
 	type HunkConfig,
 	gutterColor,
 	resolvePalette,
 	tintBgAnsi,
 	TOKENIZE_MAX_LINE_LENGTH,
 	TOKENIZE_TIME_LIMIT_MS,
-	type WordHighlight,
 } from "./config";
 import { displayPath, fileKey } from "./paths";
+import { ANSI_RESET, type Highlighter, type Range, renderCodeLine, type ShikiTokenLine } from "./styling";
 
-export type Highlighter = HighlighterGeneric<string, string>;
+export type { Highlighter, Range } from "./styling";
 
 // ============================================================================
 // Patch model (single source of truth for renderer + bridge correlation)
 // ============================================================================
-
-export type Range = { start: number; end: number };
 
 export type DiffLine = {
 	kind: "add" | "remove" | "context" | "meta";
@@ -241,8 +237,6 @@ function filteredHunkLines(hunk: ParsedHunk, config: HunkConfig, hunkIndex = 0, 
 // Hunk tokenization — whole-side, grammar state carried across lines
 // ============================================================================
 
-type ShikiTokenLine = ReturnType<Highlighter["codeToTokensBase"]>[number];
-
 const lazyLanguageLoads = new WeakMap<Highlighter, Set<string>>();
 const lazyLanguageFailures = new WeakMap<Highlighter, Set<string>>();
 
@@ -350,67 +344,13 @@ function tokensForLine(
 }
 
 // ============================================================================
-// Token styling
+// Line furniture
 // ============================================================================
-
-const ANSI_RESET = "\x1b[0m";
 
 function visibleSlice(input: string, width: number): string {
 	if (visibleWidth(input) <= width) return input;
 	return truncateToWidth(input, Math.max(0, width - 1)) + "…";
 }
-
-function wordHighlightAnsi(style: WordHighlight, side: DiffSide, theme: Theme): string {
-	if (style === "none") return "";
-	if (style === "bold") return "\x1b[1m";
-	if (style === "underline") return "\x1b[1;4m";
-	if (style === "inverse") return "\x1b[1;7m";
-	if (style === "strike") return side === "remove" ? "\x1b[1;9m" : "\x1b[1;4m";
-	if (style === "color") return side === "add" ? theme.getFgAnsi("accent") || "" : theme.getFgAnsi("warning") || theme.getFgAnsi("error") || "";
-	return "";
-}
-
-function inRanges(index: number, ranges: Range[]): boolean {
-	return ranges.some((r) => index >= r.start && index < r.end);
-}
-
-function styleToken(text: string, color: string | undefined, emph: boolean, side: DiffSide, config: HunkConfig, theme: Theme, sideAnsi: string): string {
-	let start = ansiFg(color);
-	if (emph) start += wordHighlightAnsi(config.wordHighlight, side, theme);
-	if (!start) return text;
-	return `${start}${text}${ANSI_RESET}${sideAnsi}`;
-}
-
-function renderCodeLine(
-	line: string,
-	tokens: ShikiTokenLine | undefined,
-	theme: Theme,
-	config: HunkConfig,
-	side: DiffSide,
-	ranges: Range[],
-	sideAnsi: string,
-): string {
-	if (!tokens) return sideAnsi + line + ANSI_RESET;
-	try {
-		let out = sideAnsi;
-		let cursor = 0;
-		for (const token of tokens) {
-			const content = token.content;
-			for (const ch of content) {
-				const emph = inRanges(cursor, ranges);
-				out += styleToken(ch, token.color, emph, side, config, theme, sideAnsi);
-				cursor += ch.length;
-			}
-		}
-		return out + ANSI_RESET;
-	} catch {
-		return sideAnsi + line + ANSI_RESET;
-	}
-}
-
-// ============================================================================
-// Line furniture
-// ============================================================================
 
 function lineNoText(line: DiffLine, palette: { lineNo: string }, mode: HunkConfig["lineNumbers"]): string {
 	const isChanged = line.kind === "add" || line.kind === "remove";
@@ -462,34 +402,43 @@ export type DiffViewInput = {
 	invalidate?: () => void;
 };
 
-export function renderDiffLines(input: DiffViewInput): string[] {
-	const { patch, filePath, cwd, title, config, highlighter, theme, liveSession, annotations, invalidate } = input;
+// --- Layout seam -----------------------------------------------------------
+// `buildDiffLayout` is the reusable row layout: parsed patch + styled lines +
+// optional annotations -> ordered `DiffRow[]` with folding, furniture, inline
+// note margins, and max-row truncation. `renderDiffLines` is the thin composer
+// that frames those rows with the file header and the hunk-hint footer. The
+// review-notes view, `/hunk review`, and the configure preview can reuse the
+// row layout without re-entering the renderer's framing logic.
+
+export type DiffRow =
+	| { kind: "hunkCaption"; text: string; hunkIndex: number }
+	| { kind: "code"; text: string; hunkIndex: number; lineIndex: number }
+	| { kind: "fold"; text: string }
+	| { kind: "meta"; text: string };
+
+export type DiffLayout = {
+	rows: DiffRow[];
+	truncated: boolean;
+	stats: { added: number; removed: number; hunks: number };
+};
+
+/** Build the ordered body rows (hunk captions + code/fold/meta) for a patch.
+ *  Pure: tokenization, side colors, word emphasis, line furniture, folding, and
+ *  max-row truncation all resolve here. Annotations are baked into the code
+ *  row they address. Header and footer are the caller's concern. */
+export function buildDiffLayout(input: DiffViewInput): DiffLayout {
+	const { patch, filePath, cwd, config, highlighter, theme, annotations, invalidate } = input;
 	const parsed = parseUnifiedPatch(patch);
 	const stats = countStats(parsed);
 	const lang = getLanguageFromPath(filePath) ?? "text";
 	const shikiTheme = displayTheme(config, theme);
 	const palette = resolvePalette(config, theme);
 	const symbols = config.symbols;
-	const lines: string[] = [];
-	const accent = theme.fg("accent", "✦");
-	const headerColor = palette.header;
-	const pathLabel = `${headerColor}${theme.bold(displayPath(filePath, cwd))}${ANSI_RESET}`;
-	const statsLabel = `${palette.add}+${stats.added}${ANSI_RESET} ${palette.remove}-${stats.removed}${ANSI_RESET} ${theme.fg("muted", `${stats.hunks} hunk${stats.hunks === 1 ? "" : "s"}`)}`;
-
-	if (config.header === "minimal") {
-		lines.push(`${accent} ${pathLabel}`);
-	} else if (config.header === "compact") {
-		lines.push(`${accent} ${headerColor}${theme.bold(title)}${ANSI_RESET} ${theme.fg("dim", "·")} ${pathLabel}  ${statsLabel}`);
-	} else {
-		lines.push(`${accent} ${theme.fg("borderMuted", "╭─")} ${headerColor}${theme.bold(title)}${ANSI_RESET} ${theme.fg("dim", "·")} ${pathLabel}`);
-		lines.push(`${theme.fg("borderMuted", "│")} ${statsLabel}`);
-		lines.push(theme.fg("borderMuted", "╰" + "─".repeat(32)));
-	}
-
 	const lineNoMode = config.lineNumbers;
 	const isChanged = (item: DiffLine) => item.kind === "add" || item.kind === "remove";
-
 	const annotatedLineKeys = annotations ? new Set(annotations.keys()) : undefined;
+
+	const rows: DiffRow[] = [];
 	let rendered = 0;
 	let truncated = false;
 	for (let hunkIndex = 0; hunkIndex < parsed.hunks.length; hunkIndex++) {
@@ -499,7 +448,7 @@ export function renderDiffLines(input: DiffViewInput): string[] {
 			break;
 		}
 		const sides = tokenizeHunkSides(hunk, highlighter, lang, shikiTheme, invalidate);
-		lines.push(hunkCaption(hunk, filePath, cwd, theme));
+		rows.push({ kind: "hunkCaption", text: hunkCaption(hunk, filePath, cwd, theme), hunkIndex });
 		rendered++;
 		for (const item of filteredHunkLines(hunk, config, hunkIndex, annotatedLineKeys)) {
 			if (rendered >= config.maxRenderedLines) {
@@ -507,12 +456,12 @@ export function renderDiffLines(input: DiffViewInput): string[] {
 				break;
 			}
 			if (item.kind === "skip") {
-				lines.push(`${palette.meta}   ${symbols.fold} ${item.count} unchanged line${item.count === 1 ? "" : "s"}${ANSI_RESET}`);
+				rows.push({ kind: "fold", text: `${palette.meta}   ${symbols.fold} ${item.count} unchanged line${item.count === 1 ? "" : "s"}${ANSI_RESET}` });
 				rendered++;
 				continue;
 			}
 			if (item.kind === "meta") {
-				lines.push(`${palette.meta}     ${item.text}${ANSI_RESET}`);
+				rows.push({ kind: "meta", text: `${palette.meta}     ${item.text}${ANSI_RESET}` });
 				rendered++;
 				continue;
 			}
@@ -533,11 +482,36 @@ export function renderDiffLines(input: DiffViewInput): string[] {
 			const code = renderCodeLine(item.text, tokens, theme, config, side, ranges, lineAnsi);
 			const lineIndex = hunk.lines.indexOf(item);
 			const noteMargin = lineIndex >= 0 ? renderLineAnnotations(annotations?.get(patchLineAddressKey({ hunkIndex, lineIndex })), theme) : "";
-			lines.push(`${marker} ${nums}${signStyled} ${code}${noteMargin}`);
+			rows.push({ kind: "code", text: `${marker} ${nums}${signStyled} ${code}${noteMargin}`, hunkIndex, lineIndex });
 			rendered++;
 		}
 		if (truncated) break;
 	}
+	return { rows, truncated, stats };
+}
+
+/** Render a patch to terminal lines: file header + layout rows + footers. */
+export function renderDiffLines(input: DiffViewInput): string[] {
+	const { filePath, cwd, title, config, theme, liveSession } = input;
+	const palette = resolvePalette(config, theme);
+	const { rows, truncated, stats } = buildDiffLayout(input);
+	const lines: string[] = [];
+	const accent = theme.fg("accent", "✦");
+	const headerColor = palette.header;
+	const pathLabel = `${headerColor}${theme.bold(displayPath(filePath, cwd))}${ANSI_RESET}`;
+	const statsLabel = `${palette.add}+${stats.added}${ANSI_RESET} ${palette.remove}-${stats.removed}${ANSI_RESET} ${theme.fg("muted", `${stats.hunks} hunk${stats.hunks === 1 ? "" : "s"}`)}`;
+
+	if (config.header === "minimal") {
+		lines.push(`${accent} ${pathLabel}`);
+	} else if (config.header === "compact") {
+		lines.push(`${accent} ${headerColor}${theme.bold(title)}${ANSI_RESET} ${theme.fg("dim", "·")} ${pathLabel}  ${statsLabel}`);
+	} else {
+		lines.push(`${accent} ${theme.fg("borderMuted", "╭─")} ${headerColor}${theme.bold(title)}${ANSI_RESET} ${theme.fg("dim", "·")} ${pathLabel}`);
+		lines.push(`${theme.fg("borderMuted", "│")} ${statsLabel}`);
+		lines.push(theme.fg("borderMuted", "╰" + "─".repeat(32)));
+	}
+
+	for (const row of rows) lines.push(row.text);
 
 	if (truncated) lines.push(`${palette.meta}… truncated after ${config.maxRenderedLines} rendered diff rows${ANSI_RESET}`);
 	const footer = hunkFooter(config, theme, !!liveSession);

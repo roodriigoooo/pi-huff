@@ -12,6 +12,7 @@ import {
 	type PatchLineAddress,
 } from "./diff-view";
 import { displayPath, fileKey } from "./paths";
+import type { PatchEntry, PatchSource, RefreshablePatchSource } from "./patch-source";
 
 // ============================================================================
 // Types
@@ -90,7 +91,11 @@ async function hunkExec(cwd: string, command: string, args: string[], timeout = 
 	});
 }
 
-async function runHunkJson(cwd: string, args: string[], config: HunkConfig, timeout = 20_000, signal?: AbortSignal): Promise<any | undefined> {
+/** Run a `hunk` CLI subcommand and parse its JSON stdout. Returns undefined on
+ *  non-zero exit or unparseable output. Exported so the reviewed-patch source
+ *  can fetch `session review --include-patch --include-notes` through the same
+ *  defensive exec path as the rest of the bridge. */
+export async function runHunkJson(cwd: string, args: string[], config: HunkConfig, timeout = 20_000, signal?: AbortSignal): Promise<any | undefined> {
 	const execResult = await hunkExec(cwd, config.hunk.binary, args, timeout, signal);
 	if (execResult.code !== 0) return undefined;
 	try {
@@ -98,6 +103,13 @@ async function runHunkJson(cwd: string, args: string[], config: HunkConfig, time
 	} catch {
 		return undefined;
 	}
+}
+
+/** Refresh a patch source's cache if it is refreshable; no-op for plain sources
+ *  (e.g. the agent-edit adapter used in unit tests). */
+async function refreshPatchSource(source: PatchSource, cwd: string, config: HunkConfig, signal?: AbortSignal): Promise<void> {
+	const refresh = (source as RefreshablePatchSource).refresh;
+	if (typeof refresh === "function") await refresh.call(source, cwd, config, signal);
 }
 
 // ============================================================================
@@ -180,7 +192,7 @@ export function normalizeHunkComments(payload: any): HunkComment[] {
 }
 
 // ============================================================================
-// Note shaping
+// Note shaping — pinned onto the patch a PatchSource says to use
 // ============================================================================
 
 function commentLocation(c: Pick<HunkComment, "oldLine" | "newLine">): string {
@@ -248,24 +260,17 @@ function buildReviewPrompt(comments: HunkComment[], cwd: string, shape?: ReviewN
 	return lines.join("\n");
 }
 
-export type RenderRecordLike = {
-	tool: "write" | "edit";
-	filePath: string;
-	patch: string;
-	summary: string;
-};
-
-function parseRecordPatch(record: RenderRecordLike): ParsedPatch {
-	return parseUnifiedPatch(record.patch);
+function parseEntryPatch(entry: PatchEntry): ParsedPatch {
+	return parseUnifiedPatch(entry.patch);
 }
 
-function noteAddressInRecord(note: HunkComment, record: RenderRecordLike, cwd: string, parsed = parseRecordPatch(record)): PatchLineAddress | undefined {
-	if (fileKey(note.filePath, cwd) !== fileKey(record.filePath, cwd)) return undefined;
+function noteAddressInEntry(note: HunkComment, entry: PatchEntry, cwd: string, parsed = parseEntryPatch(entry)): PatchLineAddress | undefined {
+	if (fileKey(note.filePath, cwd) !== fileKey(entry.filePath, cwd)) return undefined;
 	return findPatchLineAddress(parsed, note, cwd);
 }
 
-function noteOverlapsRecord(note: HunkComment, record: RenderRecordLike, cwd: string): boolean {
-	return !!noteAddressInRecord(note, record, cwd);
+function noteOverlapsEntry(note: HunkComment, entry: PatchEntry, cwd: string): boolean {
+	return !!noteAddressInEntry(note, entry, cwd);
 }
 
 function sortedReviewHunks(hunks: ReviewNoteHunk[]): ReviewNoteHunk[] {
@@ -274,37 +279,41 @@ function sortedReviewHunks(hunks: ReviewNoteHunk[]): ReviewNoteHunk[] {
 		.sort((a, b) => a.filePath.localeCompare(b.filePath) || a.hunkIndex - b.hunkIndex);
 }
 
-export function buildReviewNoteShape(comments: HunkComment[], findRecent: (filePath: string | undefined, cwd: string) => RenderRecordLike | undefined, cwd: string): ReviewNoteShape {
+/** Shape notes by the rendered hunk row each one pins onto, using the patch a
+ *  `PatchSource` supplies for the note's file. Pure + testable: pass any
+ *  `findForFile` callback (an agent-edit source, a reviewed-patch source, or a
+ *  test stub) and the shape is the same for the same patch. */
+export function buildReviewNoteShape(comments: HunkComment[], findForFile: (filePath: string | undefined, cwd: string) => PatchEntry | undefined, cwd: string): ReviewNoteShape {
 	const hunks = new Map<string, ReviewNoteHunk>();
 	const lineMaps = new Map<string, Map<string, ReviewNoteLine>>();
-	const parsedCache = new Map<RenderRecordLike, ParsedPatch>();
+	const parsedCache = new Map<PatchEntry, ParsedPatch>();
 	const openComments: HunkComment[] = [];
-	const parsedFor = (record: RenderRecordLike) => {
-		let parsed = parsedCache.get(record);
+	const parsedFor = (entry: PatchEntry) => {
+		let parsed = parsedCache.get(entry);
 		if (!parsed) {
-			parsed = parseRecordPatch(record);
-			parsedCache.set(record, parsed);
+			parsed = parseEntryPatch(entry);
+			parsedCache.set(entry, parsed);
 		}
 		return parsed;
 	};
 
 	for (const comment of comments) {
-		const record = findRecent(comment.filePath, cwd);
-		if (!record) {
+		const entry = findForFile(comment.filePath, cwd);
+		if (!entry) {
 			openComments.push(comment);
 			continue;
 		}
-		const parsed = parsedFor(record);
-		const address = noteAddressInRecord(comment, record, cwd, parsed);
+		const parsed = parsedFor(entry);
+		const address = noteAddressInEntry(comment, entry, cwd, parsed);
 		const parsedHunk = address ? parsed.hunks[address.hunkIndex] : undefined;
 		if (!address || !parsedHunk) {
 			openComments.push(comment);
 			continue;
 		}
-		const hunkKey = `${fileKey(record.filePath, cwd)}:${address.hunkIndex}`;
+		const hunkKey = `${fileKey(entry.filePath, cwd)}:${address.hunkIndex}`;
 		let hunk = hunks.get(hunkKey);
 		if (!hunk) {
-			hunk = { filePath: record.filePath, summary: record.summary, hunkIndex: address.hunkIndex, header: parsedHunk.header, lines: [] };
+			hunk = { filePath: entry.filePath, summary: entry.summary, hunkIndex: address.hunkIndex, header: parsedHunk.header, lines: [] };
 			hunks.set(hunkKey, hunk);
 			lineMaps.set(hunkKey, new Map());
 		}
@@ -322,11 +331,12 @@ export function buildReviewNoteShape(comments: HunkComment[], findRecent: (fileP
 	return { hunks: sortedReviewHunks([...hunks.values()]), openComments };
 }
 
-export function reviewAnnotationsForRecord(comments: HunkComment[], record: RenderRecordLike, cwd: string): DiffLineAnnotations {
-	const parsed = parseRecordPatch(record);
+/** Build inline diff-line annotations for a single patch entry's notes. */
+export function reviewAnnotationsForRecord(comments: HunkComment[], entry: PatchEntry, cwd: string): DiffLineAnnotations {
+	const parsed = parseEntryPatch(entry);
 	const annotations = new Map<string, Array<{ text: string; detail?: string; author?: string; label?: string }>>();
 	for (const comment of comments) {
-		const address = noteAddressInRecord(comment, record, cwd, parsed);
+		const address = noteAddressInEntry(comment, entry, cwd, parsed);
 		if (!address) continue;
 		const key = patchLineAddressKey(address);
 		const list = annotations.get(key) ?? [];
@@ -336,11 +346,11 @@ export function reviewAnnotationsForRecord(comments: HunkComment[], record: Rend
 	return annotations;
 }
 
-/** Filter notes to those overlapping any recent edit. Pure + testable. */
-export function notesRelevantToRecords(notes: HunkComment[], findRecent: (filePath: string | undefined, cwd: string) => RenderRecordLike | undefined, cwd: string): HunkComment[] {
+/** Filter notes to those overlapping any patch the source supplies. Pure + testable. */
+export function notesRelevantToRecords(notes: HunkComment[], findForFile: (filePath: string | undefined, cwd: string) => PatchEntry | undefined, cwd: string): HunkComment[] {
 	return notes.filter((note) => {
-		const record = findRecent(note.filePath, cwd);
-		return record ? noteOverlapsRecord(note, record, cwd) : false;
+		const entry = findForFile(note.filePath, cwd);
+		return entry ? noteOverlapsEntry(note, entry, cwd) : false;
 	});
 }
 
@@ -361,26 +371,20 @@ export interface ReviewBridge {
 	pickup(cwd: string, config: HunkConfig, signal?: AbortSignal): Promise<{ result: ReviewNotesResult; inject: boolean }>;
 	/** Forget the last-seen signature (e.g. after `/hunk off`). */
 	resetSignature(): void;
-	/** Render notes through the shared visual language. */
-	renderNotesLines(
-		result: ReviewNotesResult | undefined,
-		findRecent: (filePath: string | undefined, cwd: string) => RenderRecordLike | undefined,
-		cwd: string,
-		theme: Theme,
-		config: HunkConfig,
-		highlighter: Highlighter | undefined,
-	): string[];
+	/** Render notes through the shared visual language. The bridge's patch source
+	 *  supplies the patch to pin each note onto; nothing is threaded by the caller. */
+	renderNotesLines(result: ReviewNotesResult | undefined, cwd: string, theme: Theme, config: HunkConfig, highlighter: Highlighter | undefined): string[];
 	/** Render read-only review state for the human-facing `/hunk review` view. */
-	renderReviewLines(
-		result: ReviewNotesResult | undefined,
-		findRecent: (filePath: string | undefined, cwd: string) => RenderRecordLike | undefined,
-		cwd: string,
-		theme: Theme,
-	): string[];
+	renderReviewLines(result: ReviewNotesResult | undefined, cwd: string, theme: Theme): string[];
 }
 
-export function createHunkBridge(findRecent?: (filePath: string | undefined, cwd: string) => RenderRecordLike | undefined): ReviewBridge {
+/** Build a review bridge over one `PatchSource`. The source is wired once here;
+ *  every correlation and render path asks it for the patch to pin against, so
+ *  `findRecent` is no longer threaded through each call site. Refreshable sources
+ *  (the reviewed-patch composite) are refreshed while a live session is held. */
+export function createHunkBridge(patchSource: PatchSource): ReviewBridge {
 	let lastSignature = "";
+	const findForFile = (filePath: string | undefined, cwd: string): PatchEntry | undefined => patchSource.findForFile(filePath, cwd);
 
 	return {
 		probeSession(cwd, config, signal) {
@@ -397,18 +401,22 @@ export function createHunkBridge(findRecent?: (filePath: string | undefined, cwd
 					message: `No live Hunk session is attached to ${cwd}. Open another terminal in this repo and run: hunk diff --watch`,
 				};
 			}
+			// Refresh the reviewed-patch cache while we already hold a live session,
+			// so correlation pins against the patch the human is actually reviewing.
+			// A plain agent-edit source is not refreshable and this is a no-op.
+			await refreshPatchSource(patchSource, cwd, config, signal);
 			const commentsPayload = await runHunkJson(cwd, ["session", "comment", "list", "--repo", cwd, "--type", "user", "--json"], config, 20_000, signal);
 			if (!commentsPayload) {
 				return { live: true, session, comments: [], message: "Live Hunk session found, but no user comments were returned." };
 			}
 			const comments = normalizeHunkComments(commentsPayload);
-			const shape = findRecent ? buildReviewNoteShape(comments, findRecent, cwd) : undefined;
+			const shape = buildReviewNoteShape(comments, findForFile, cwd);
 			return {
 				live: true,
 				session,
 				comments,
-				hunks: shape?.hunks,
-				openComments: shape?.openComments,
+				hunks: shape.hunks,
+				openComments: shape.openComments,
 				message: comments.length ? buildReviewPrompt(comments, cwd, shape) : "Live Hunk session found. No user Hunk comments are open.",
 			};
 		},
@@ -416,12 +424,11 @@ export function createHunkBridge(findRecent?: (filePath: string | undefined, cwd
 		async pickup(cwd, config, signal) {
 			const result = await this.readNotes(cwd, config, signal);
 			if (!config.hunk.autoReviewNotes || !result.live) return { result, inject: false };
-			// Scope to notes that overlap a recent edit, so notes about untouched
-			// files never trigger pickup on their own. When no findRecent seam is
-			// wired (older callers), fall back to all notes.
-			const relevant = findRecent ? notesRelevantToRecords(result.comments, findRecent, cwd) : result.comments;
-			const shape = findRecent ? buildReviewNoteShape(relevant, findRecent, cwd) : undefined;
-			const scoped: ReviewNotesResult = relevant.length === result.comments.length ? result : { ...result, comments: relevant, hunks: shape?.hunks, openComments: shape?.openComments, message: buildReviewPrompt(relevant, cwd, shape) };
+			// Scope to notes that overlap a patch the source supplies, so notes about
+			// untouched files never trigger pickup on their own.
+			const relevant = notesRelevantToRecords(result.comments, findForFile, cwd);
+			const shape = buildReviewNoteShape(relevant, findForFile, cwd);
+			const scoped: ReviewNotesResult = relevant.length === result.comments.length ? result : { ...result, comments: relevant, hunks: shape.hunks, openComments: shape.openComments, message: buildReviewPrompt(relevant, cwd, shape) };
 			if (relevant.length < 1) return { result: scoped, inject: false };
 			const signature = reviewNotesSignature(scoped.comments, cwd);
 			if (signature === lastSignature) return { result: scoped, inject: false };
@@ -433,7 +440,7 @@ export function createHunkBridge(findRecent?: (filePath: string | undefined, cwd
 			lastSignature = "";
 		},
 
-		renderNotesLines(result, findRecent, cwd, theme, config, highlighter) {
+		renderNotesLines(result, cwd, theme, config, highlighter) {
 			const lines: string[] = [];
 			lines.push(`${theme.fg("accent", "✦")} ${theme.fg("borderMuted", "╭─")} ${theme.fg("toolTitle", theme.bold("Hunk review notes"))}`);
 			if (!result) {
@@ -441,7 +448,7 @@ export function createHunkBridge(findRecent?: (filePath: string | undefined, cwd
 				lines.push(theme.fg("borderMuted", "╰" + "─".repeat(32)));
 				return lines;
 			}
-			const shape = buildReviewNoteShape(result.comments, findRecent, cwd);
+			const shape = buildReviewNoteShape(result.comments, findForFile, cwd);
 			const touched = shape.hunks.reduce((count, hunk) => count + hunk.lines.reduce((inner, line) => inner + line.comments.length, 0), 0);
 			const status = result.live ? `${result.comments.length} user note${result.comments.length === 1 ? "" : "s"} · ${touched} pinned` : "no live session";
 			lines.push(`${theme.fg("borderMuted", "│")} ${theme.fg(result.live ? "toolDiffAdded" : "warning", status)}`);
@@ -453,12 +460,12 @@ export function createHunkBridge(findRecent?: (filePath: string | undefined, cwd
 			const configNoFooter = { ...config, showHunkHint: false };
 			const renderedRecords = new Set<string>();
 			for (const hunk of shape.hunks) {
-				const record = findRecent(hunk.filePath, cwd);
+				const record = findForFile(hunk.filePath, cwd);
 				const recordKey = record ? `${fileKey(record.filePath, cwd)}\0${record.patch}` : undefined;
 				if (!record || !recordKey || renderedRecords.has(recordKey)) continue;
 				renderedRecords.add(recordKey);
 				const recordComments = result.comments.filter((comment) => {
-					const commentRecord = findRecent(comment.filePath, cwd);
+					const commentRecord = findForFile(comment.filePath, cwd);
 					return commentRecord ? `${fileKey(commentRecord.filePath, cwd)}\0${commentRecord.patch}` === recordKey : false;
 				});
 				const annotations = reviewAnnotationsForRecord(recordComments, record, cwd);
@@ -479,7 +486,7 @@ export function createHunkBridge(findRecent?: (filePath: string | undefined, cwd
 			return lines;
 		},
 
-		renderReviewLines(result, findRecent, cwd, theme) {
+		renderReviewLines(result, cwd, theme) {
 			const lines: string[] = [];
 			lines.push(`${theme.fg("accent", "✦")} ${theme.fg("borderMuted", "╭─")} ${theme.fg("toolTitle", theme.bold("Hunk review"))}`);
 			if (!result) {
@@ -498,7 +505,7 @@ export function createHunkBridge(findRecent?: (filePath: string | undefined, cwd
 				lines.push(theme.fg("borderMuted", "╰" + "─".repeat(32)));
 				return lines;
 			}
-			const shape = buildReviewNoteShape(result.comments, findRecent, cwd);
+			const shape = buildReviewNoteShape(result.comments, findForFile, cwd);
 			const touched = shape.hunks.reduce((count, hunk) => count + hunk.lines.reduce((inner, line) => inner + line.comments.length, 0), 0);
 			const open = shape.openComments.length;
 			lines.push(`${theme.fg("borderMuted", "│")} ${theme.fg("toolDiffAdded", `${touched} touched`)} ${theme.fg("dim", "·")} ${theme.fg("warning", `${open} open`)}`);
