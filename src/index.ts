@@ -13,13 +13,13 @@ import {
 import { Text, truncateToWidth, wrapTextWithAnsi, type AutocompleteItem } from "@earendil-works/pi-tui";
 import fs from "node:fs/promises";
 import { Type } from "typebox";
-import { type HunkConfig, loadConfig, mergeConfig } from "./config";
+import { mergeConfig } from "./config";
 import { openHunkConfig } from "./configure";
 import { createDiffView, DiffComponent, writePatch } from "./diff-view";
-import { createHighlighterCache } from "./highlighter-cache";
-import { createHunkBridge, type ReviewNotesResult, stringOr } from "./hunk-bridge";
+import { createExtensionState, type ExtensionState } from "./extension-state";
+import { type ReviewNotesResult, stringOr } from "./hunk-bridge";
 import { displayPath, resolveUserPath } from "./paths";
-import { createRenderRecordStore, type RenderRecord } from "./render-records";
+import { type RenderRecord } from "./render-records";
 
 // ============================================================================
 // /hunk command dispatch (status · send · on|off · review · configure)
@@ -49,19 +49,8 @@ function hunkArgumentCompletions(prefix: string): AutocompleteItem[] {
 	return HUNK_SUBCOMMANDS.filter((c) => c.value.startsWith(first));
 }
 
-async function handleHunkCommand(
-	args: string,
-	ctx: ExtensionCommandContext,
-	pi: ExtensionAPI,
-	getConfig: () => HunkConfig,
-	setConfig: (config: HunkConfig) => void,
-	setLiveSession: (live: boolean) => void,
-	resetAutoSignature: () => void,
-	recordCount: () => number,
-	findRecent: (filePath: string | undefined, cwd: string) => { filePath: string; patch: string; summary: string } | undefined,
-	bridge: ReturnType<typeof createHunkBridge>,
-) {
-	const config = getConfig();
+async function handleHunkCommand(args: string, ctx: ExtensionCommandContext, pi: ExtensionAPI, state: ExtensionState) {
+	const config = state.getConfig();
 	const [sub = "status", arg = ""] = args.trim().split(/\s+/).filter(Boolean);
 	const wantsAutoOn = sub === "on" || (sub === "auto" && arg === "on");
 	const wantsAutoOff = sub === "off" || (sub === "auto" && arg === "off");
@@ -70,27 +59,27 @@ async function handleHunkCommand(
 		return;
 	}
 	if (sub === "status" || sub === "help") {
-		const session = await bridge.probeSession(ctx.cwd, config, ctx.signal);
+		const session = await state.bridge.probeSession(ctx.cwd, config, ctx.signal);
 		const live = !!session;
-		setLiveSession(live);
+		state.setLiveSession(live);
 		const auto = config.hunk.autoReviewNotes ? "on" : "off";
 		if (live) {
 			const id = stringOr(session?.id ?? session?.sessionId ?? session?.session?.id);
-			ctx.ui.notify(`pi-hunk is active. Recent diffs: ${recordCount()}. Auto review pickup: ${auto}. Live Hunk session${id ? `: ${id}` : " detected"}. Commands: /hunk status, /hunk send, /hunk on|off, /hunk review, /hunk configure.`, "info");
+			ctx.ui.notify(`pi-hunk is active. Recent diffs: ${state.records.recentCount()}. Auto review pickup: ${auto}. Live Hunk session${id ? `: ${id}` : " detected"}. Commands: /hunk status, /hunk send, /hunk on|off, /hunk review, /hunk configure.`, "info");
 		} else {
-			ctx.ui.notify(`pi-hunk is active. Recent diffs: ${recordCount()}. Auto review pickup: ${auto}. No live Hunk session. Open another terminal in this repo and run: hunk diff --watch`, "info");
+			ctx.ui.notify(`pi-hunk is active. Recent diffs: ${state.records.recentCount()}. Auto review pickup: ${auto}. No live Hunk session. Open another terminal in this repo and run: hunk diff --watch`, "info");
 		}
 		return;
 	}
 	if (wantsAutoOn) {
-		setConfig(mergeConfig(config, { hunk: { autoReviewNotes: true, autoReviewNotesMin: 1 } }));
-		resetAutoSignature();
+		state.setConfig(mergeConfig(config, { hunk: { autoReviewNotes: true, autoReviewNotesMin: 1 } }));
+		state.bridge.resetSignature();
 		ctx.ui.notify("Hunk auto review pickup enabled. New relevant notes attach before the next agent turn; no turn starts by itself.", "info");
 		return;
 	}
 	if (wantsAutoOff) {
-		setConfig(mergeConfig(config, { hunk: { autoReviewNotes: false } }));
-		resetAutoSignature();
+		state.setConfig(mergeConfig(config, { hunk: { autoReviewNotes: false } }));
+		state.bridge.resetSignature();
 		ctx.ui.notify("Hunk auto review pickup disabled.", "info");
 		return;
 	}
@@ -99,8 +88,8 @@ async function handleHunkCommand(
 		return;
 	}
 	if (sub === "send") {
-		const notes = await bridge.readNotes(ctx.cwd, config, ctx.signal);
-		setLiveSession(notes.live);
+		const notes = await state.bridge.readNotes(ctx.cwd, config, ctx.signal);
+		state.setLiveSession(notes.live);
 		if (!notes.live) {
 			ctx.ui.notify(notes.message, "warning");
 			return;
@@ -114,8 +103,8 @@ async function handleHunkCommand(
 		return;
 	}
 	if (sub === "review") {
-		let notes = await bridge.readNotes(ctx.cwd, config, ctx.signal);
-		setLiveSession(notes.live);
+		let notes = await state.bridge.readNotes(ctx.cwd, config, ctx.signal);
+		state.setLiveSession(notes.live);
 		if (ctx.mode !== "tui") {
 			ctx.ui.notify(notes.live ? `${notes.comments.length} user note(s).` : notes.message, notes.live ? "info" : "warning");
 			return;
@@ -124,11 +113,11 @@ async function handleHunkCommand(
 		await ctx.ui.custom<void>((tui, nextTheme, _kb, done) => {
 			theme = nextTheme;
 			const refresh = () => {
-				bridge
+				state.bridge
 					.readNotes(ctx.cwd, config, ctx.signal)
 					.then((next) => {
 						notes = next;
-						setLiveSession(notes.live);
+						state.setLiveSession(notes.live);
 						tui.requestRender();
 					})
 					.catch(() => {});
@@ -136,7 +125,7 @@ async function handleHunkCommand(
 			return {
 				render(width: number): string[] {
 					const w = Math.max(20, width);
-					const lines = bridge.renderReviewLines(notes, findRecent, ctx.cwd, theme);
+					const lines = state.bridge.renderReviewLines(notes, ctx.cwd, theme);
 					return lines.flatMap((line) => wrapTextWithAnsi(line, w)).map((line) => truncateToWidth(line, w));
 				},
 				invalidate() {},
@@ -163,36 +152,25 @@ async function handleHunkCommand(
 // ============================================================================
 
 export default async function (pi: ExtensionAPI) {
-	let config = await loadConfig(process.cwd());
-	let liveHunkSession = false;
-
-	const highlighters = createHighlighterCache();
-	const records = createRenderRecordStore();
-	const bridge = createHunkBridge((filePath, cwd) => records.findRecent(filePath, cwd));
-
-	await highlighters.refresh(config);
+	const state = await createExtensionState();
 
 	const editBase = createEditToolDefinition(process.cwd());
 	const writeBase = createWriteToolDefinition(process.cwd());
 
 	pi.on("session_start", async (_event, ctx) => {
-		config = await loadConfig(ctx.cwd);
-		await highlighters.refresh(config);
-		ctx.ui.setStatus("hunk", config.enabled ? "hunk ✦" : undefined);
-		bridge
-			.probeSession(ctx.cwd, config, ctx.signal)
-			.then((session) => {
-				liveHunkSession = !!session;
-			})
-			.catch(() => {
-				liveHunkSession = false;
-			});
+		await state.reloadConfig(ctx.cwd);
+		ctx.ui.setStatus("hunk", state.getConfig().enabled ? "hunk ✦" : undefined);
+		state.bridge
+			.probeSession(ctx.cwd, state.getConfig(), ctx.signal)
+			.then((session) => state.setLiveSession(!!session))
+			.catch(() => state.setLiveSession(false));
 	});
 
 	pi.on("before_agent_start", async (_event, ctx) => {
+		const config = state.getConfig();
 		if (!config.hunk.enabled || !config.hunk.reviewTool || !config.hunk.autoReviewNotes) return;
-		const { result, inject } = await bridge.pickup(ctx.cwd, config, ctx.signal);
-		liveHunkSession = result.live;
+		const { result, inject } = await state.bridge.pickup(ctx.cwd, config, ctx.signal);
+		state.setLiveSession(result.live);
 		if (!inject) return;
 		ctx.ui.notify(`Picked up ${result.comments.length} Hunk review note(s).`, "info");
 		return {
@@ -217,27 +195,16 @@ export default async function (pi: ExtensionAPI) {
 				}
 				await openHunkConfig(
 					ctx,
-					() => config,
+					() => state.getConfig(),
 					async (nextConfig) => {
-						config = nextConfig;
-						await highlighters.refresh(nextConfig);
+						state.setConfig(nextConfig);
+						await state.highlighters.refresh(nextConfig);
 					},
-					(nextConfig, invalidate) => highlighters.get(nextConfig, invalidate),
+					(nextConfig, invalidate) => state.highlighters.get(nextConfig, invalidate),
 				);
 				return;
 			}
-			await handleHunkCommand(
-				args,
-				ctx,
-				pi,
-				() => config,
-				(nextConfig) => (config = nextConfig),
-				(live) => (liveHunkSession = live),
-				() => bridge.resetSignature(),
-				() => records.recentCount(),
-				(filePath, cwd) => records.findRecent(filePath, cwd),
-				bridge,
-			);
+			await handleHunkCommand(args, ctx, pi, state);
 		},
 	});
 
@@ -253,18 +220,20 @@ export default async function (pi: ExtensionAPI) {
 		parameters: Type.Object({}),
 		renderShell: "self",
 		async execute(_toolCallId, _params, signal, _onUpdate, ctx: ExtensionContext) {
+			const config = state.getConfig();
 			if (!config.hunk.enabled || !config.hunk.reviewTool) {
 				return { content: [{ type: "text", text: "pi-hunk's read-only Hunk review tool is disabled in config." }], details: { live: false, comments: [], message: "disabled" } satisfies ReviewNotesResult };
 			}
-			const notes = await bridge.readNotes(ctx.cwd, config, signal);
-			liveHunkSession = notes.live;
+			const notes = await state.bridge.readNotes(ctx.cwd, config, signal);
+			state.setLiveSession(notes.live);
 			return { content: [{ type: "text", text: notes.message }], details: notes };
 		},
 		renderCall(_args, theme: Theme) {
 			return new Text(`${theme.fg("accent", "✦")} ${theme.fg("toolTitle", theme.bold("hunk_review_notes"))} ${theme.fg("dim", "· read-only")}`, 0, 0);
 		},
 		renderResult(result, _options, theme: Theme, context: ToolRenderContext<any, Record<string, never>>) {
-			return new DiffComponent(() => bridge.renderNotesLines(result.details as ReviewNotesResult | undefined, (filePath, cwd) => records.findRecent(filePath, cwd), context.cwd, theme, config, highlighters.get(config, context.invalidate)));
+			const config = state.getConfig();
+			return new DiffComponent(() => state.bridge.renderNotesLines(result.details as ReviewNotesResult | undefined, context.cwd, theme, config, state.highlighters.get(config, context.invalidate)));
 		},
 	});
 
@@ -284,7 +253,7 @@ export default async function (pi: ExtensionAPI) {
 					patch: details.patch,
 					summary: `Edited ${displayPath(filePath, ctx.cwd)} (${params.edits.length} replacement${params.edits.length === 1 ? "" : "s"})`,
 				};
-				records.record(toolCallId, record);
+				state.records.record(toolCallId, record);
 			}
 			return result;
 		},
@@ -292,13 +261,14 @@ export default async function (pi: ExtensionAPI) {
 			return new Text(`${theme.fg("accent", "✦")} ${theme.fg("toolTitle", theme.bold("edit"))} ${theme.fg("muted", args.path)} ${theme.fg("dim", `· ${args.edits?.length ?? 0} block(s)`)}`, 0, 0);
 		},
 		renderResult(result, _options, theme: Theme, context: ToolRenderContext<any, EditToolInput>) {
+			const config = state.getConfig();
 			const details = result.details as EditToolDetails | undefined;
-			const record = records.get(context.toolCallId);
+			const record = state.records.get(context.toolCallId);
 			const patch = record?.patch ?? details?.patch;
 			const filePath = record?.filePath ?? resolveUserPath(context.args.path, context.cwd);
 			if (!config.enabled || !patch) return new Text(details?.diff ?? "Edited file", 0, 0);
-			const activeHighlighter = highlighters.get(config, context.invalidate);
-			return createDiffView({ patch, filePath, cwd: context.cwd, title: "edited", config, highlighter: activeHighlighter, theme, liveSession: liveHunkSession, invalidate: context.invalidate });
+			const activeHighlighter = state.highlighters.get(config, context.invalidate);
+			return createDiffView({ patch, filePath, cwd: context.cwd, title: "edited", config, highlighter: activeHighlighter, theme, liveSession: state.getLiveSession(), invalidate: context.invalidate });
 		},
 	});
 
@@ -337,7 +307,7 @@ export default async function (pi: ExtensionAPI) {
 				patch,
 				summary: `${existed ? "Rewrote" : "Created"} ${rel}`,
 			};
-			records.record(toolCallId, record);
+			state.records.record(toolCallId, record);
 			return result;
 		},
 		renderCall(args: WriteToolInput, theme: Theme) {
@@ -345,9 +315,10 @@ export default async function (pi: ExtensionAPI) {
 			return new Text(`${theme.fg("accent", "✦")} ${theme.fg("toolTitle", theme.bold("write"))} ${theme.fg("muted", args.path)} ${theme.fg("dim", `· ${lines} line(s)`)}`, 0, 0);
 		},
 		renderResult(_result, _options, theme: Theme, context: ToolRenderContext<any, WriteToolInput>) {
-			const record = records.get(context.toolCallId);
+			const config = state.getConfig();
+			const record = state.records.get(context.toolCallId);
 			if (!config.enabled || !record?.patch) return new Text("Wrote file", 0, 0);
-			const activeHighlighter = highlighters.get(config, context.invalidate);
+			const activeHighlighter = state.highlighters.get(config, context.invalidate);
 			return createDiffView({
 				patch: record.patch,
 				filePath: record.filePath,
@@ -356,7 +327,7 @@ export default async function (pi: ExtensionAPI) {
 				config,
 				highlighter: activeHighlighter,
 				theme,
-				liveSession: liveHunkSession,
+				liveSession: state.getLiveSession(),
 				invalidate: context.invalidate,
 			});
 		},

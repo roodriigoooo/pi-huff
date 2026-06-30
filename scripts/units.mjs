@@ -39,12 +39,15 @@ const jiti = createJiti(import.meta.url, {
 	},
 });
 
-const { parseUnifiedPatch, renderDiffLines, findPatchLineAddress, patchLineAddressKey } = await jiti.import(path.join(repoRoot, "src", "diff-view.ts"), { default: false });
+const { parseUnifiedPatch, renderDiffLines, findPatchLineAddress, patchLineAddressKey, buildDiffLayout } = await jiti.import(path.join(repoRoot, "src", "diff-view.ts"), { default: false });
 const { DEFAULT_CONFIG, TOKENIZE_MAX_LINE_LENGTH, TOKENIZE_TIME_LIMIT_MS, ansiFg } = await jiti.import(path.join(repoRoot, "src", "config.ts"), { default: false });
 const { applyHunkPreset, choicesForSpec, descriptionForSpec, hunkConfigGroups, hunkConfigPresets } = await jiti.import(path.join(repoRoot, "src", "config-spec.ts"), { default: false });
 const { createHighlighterCache } = await jiti.import(path.join(repoRoot, "src", "highlighter-cache.ts"), { default: false });
 const { normalizeHunkComments, createHunkBridge, buildReviewNoteShape, reviewAnnotationsForRecord } = await jiti.import(path.join(repoRoot, "src", "hunk-bridge.ts"), { default: false });
-const { createRenderRecordStore } = await jiti.import(path.join(repoRoot, "src", "render-records.ts"), { default: false });
+const { createRenderRecordStore, createAgentEditPatchSource } = await jiti.import(path.join(repoRoot, "src", "render-records.ts"), { default: false });
+const { renderCodeLine, styleToken, wordHighlightAnsi, ANSI_RESET } = await jiti.import(path.join(repoRoot, "src", "styling.ts"), { default: false });
+const { createReviewedPatchSource, normalizeReviewPatches, createPatchSource } = await jiti.import(path.join(repoRoot, "src", "patch-source.ts"), { default: false });
+const { fileKey } = await jiti.import(path.join(repoRoot, "src", "paths.ts"), { default: false });
 const { writePatch } = await jiti.import(path.join(repoRoot, "src", "diff-view.ts"), { default: false });
 
 function fakeTheme() {
@@ -364,9 +367,8 @@ assert.equal(altFields[0].author, "human");
 		summary: "edited app.ts",
 	});
 
-	// findRecent seam: bridge queries by file path, store resolves to the record.
-	const findRecent = (filePath) => store.findRecent(filePath, cwd);
-	const bridge = createHunkBridge(findRecent);
+	// Agent-edit patch source: bridge queries by file path, store resolves to the record.
+	const bridge = createHunkBridge(createAgentEditPatchSource(store));
 
 	// Override readNotes so we don't shell out to hunk; inject a controlled set.
 	const notesOnEdit = { id: "n1", type: "user", filePath: "src/app.ts", newLine: 4, summary: "on the edit" };
@@ -437,8 +439,7 @@ assert.equal(altFields[0].author, "human");
 		patch: writePatch("a/src/app.ts", "b/src/app.ts", "line1\nline2\nold\nold\nold\nline6\n", "line1\nline2\nnewA\nnewB\nnewC\nline6\n"),
 		summary: "edited app.ts",
 	});
-	const findRecent = (filePath) => store.findRecent(filePath, cwd);
-	const bridge = createHunkBridge(findRecent);
+	const bridge = createHunkBridge(createAgentEditPatchSource(store));
 
 	const result = {
 		live: true,
@@ -449,7 +450,7 @@ assert.equal(altFields[0].author, "human");
 		],
 		message: "",
 	};
-	const lines = bridge.renderReviewLines(result, findRecent, cwd, fakeTheme());
+	const lines = bridge.renderReviewLines(result, cwd, fakeTheme());
 	const plain = lines.map(stripAnsi).join("\n");
 	assert.match(plain, /Hunk review/, "review header present");
 	assert.match(plain, /on the edit/, "on-edit note listed");
@@ -474,8 +475,7 @@ assert.equal(altFields[0].author, "human");
 		patch: writePatch("a/src/app.ts", "b/src/app.ts", "a\nb\nc\nd\ne\n", "a\nb\nc\n"),
 		summary: "deleted lines 4-5",
 	});
-	const findRecent = (filePath) => store.findRecent(filePath, cwd);
-	const bridge = createHunkBridge(findRecent);
+	const bridge = createHunkBridge(createAgentEditPatchSource(store));
 
 	const result = {
 		live: true,
@@ -485,7 +485,7 @@ assert.equal(altFields[0].author, "human");
 		],
 		message: "",
 	};
-	const lines = bridge.renderReviewLines(result, findRecent, cwd, fakeTheme());
+	const lines = bridge.renderReviewLines(result, cwd, fakeTheme());
 	const idx = lines.findIndex((l) => stripAnsi(l).includes("on the removed line"));
 	assert.ok(idx >= 0, "removed-line note rendered");
 	assert.match(stripAnsi(lines[idx]), /touched/i, "note on a removed line is touched, not open");
@@ -575,6 +575,150 @@ assert.equal(altFields[0].author, "human");
 	const addColorChoice = choicesForSpec(addColorSpec, DEFAULT_CONFIG, fakeTheme())[0];
 	assert.match(stripAnsi(gutterChoice.label), /\+\s+const x = 1;/, "symbol choices render glyphs inside a sample diff line");
 	assert.match(stripAnsi(addColorChoice.label), /\+ const tone = vivid/, "color choices render color inside a sample diff line");
+}
+
+// --- #8: token styling module — tint survives Shiki resets ---------------
+// styleToken is the only place a token is wrapped as `start + text + reset +
+// sideAnsi`, so a side background tint is re-applied after every Shiki reset and
+// never bleeds away mid-line. renderCodeLine is the only line assembler. This
+// locks the invariant at the adapter point, independent of the renderer.
+{
+	const theme = fakeTheme();
+	const config = { ...DEFAULT_CONFIG, wordHighlight: "bold", lineHighlight: "tint" };
+	const tintBg = "\x1b[48;2;26;44;28m";
+	const sideAnsi = `${tintBg}\x1b[38;2;80;220;120m`; // tint background + add foreground
+	const tokens = [
+		{ content: "hi", color: "#ffaaaa" },
+		{ content: "world", color: "#aaffaa" },
+	];
+	const rendered = renderCodeLine("hi world", tokens, theme, config, "add", [{ start: 0, end: 2 }], sideAnsi);
+	const resets = [...rendered.matchAll(/\x1b\[0m/g)].map((m) => m.index);
+	assert.ok(resets.length >= 2, "multiple token resets in the line");
+	// every reset except the trailing line-end reset is immediately followed by sideAnsi
+	for (let i = 0; i < resets.length - 1; i++) {
+		const after = rendered.slice(resets[i] + 4, resets[i] + 4 + sideAnsi.length);
+		assert.equal(after, sideAnsi, `reset #${i} re-applies sideAnsi (tint survives reset)`);
+	}
+	// wordHighlightAnsi is side-aware: strike strikes removals, underlines additions
+	assert.equal(wordHighlightAnsi("strike", "remove", theme), "\x1b[1;9m");
+	assert.equal(wordHighlightAnsi("strike", "add", theme), "\x1b[1;4m");
+	assert.equal(wordHighlightAnsi("none", "add", theme), "");
+	// styleToken with no emphasis and no color returns the bare text (no reset spam)
+	assert.equal(styleToken("x", undefined, false, "add", config, theme, sideAnsi), "x");
+	// styleToken with emphasis emits start + text + reset + sideAnsi
+	const emph = styleToken("y", "#ffffff", true, "add", config, theme, sideAnsi);
+	assert.match(emph, /^\x1b\[38;2;255;255;255m\x1b\[1my\x1b\[0m/);
+	assert.ok(emph.endsWith(sideAnsi), "styleToken re-applies sideAnsi after reset");
+}
+
+// --- #6: DiffView layout seam — buildDiffLayout produces reusable rows ------
+// renderDiffLines is a thin composer over buildDiffLayout; the row layout
+// (hunk captions, code/fold/meta, truncation, annotation cross-reference) is
+// reusable without the renderer's framing.
+{
+	const cwd = repoRoot;
+	const patch = [
+		"--- a/layout.ts",
+		"+++ b/layout.ts",
+		"@@ -1,8 +1,8 @@",
+		" line1",
+		" line2",
+		" line3",
+		"-old4",
+		"+new4",
+		" line5",
+		" line6",
+		" line7",
+		" line8",
+	].join("\n");
+	const config = { ...DEFAULT_CONFIG, lineNumbers: false, header: "minimal", compactUnchanged: true, contextRadius: 1, maxRenderedLines: 260 };
+	const layout = buildDiffLayout({ patch, filePath: "layout.ts", cwd, title: "unit", config, highlighter: fakeHighlighter, theme: fakeTheme(), liveSession: false });
+	assert.equal(layout.stats.added, 1);
+	assert.equal(layout.stats.removed, 1);
+	assert.equal(layout.stats.hunks, 1);
+	const kinds = layout.rows.map((r) => r.kind);
+	assert.equal(kinds[0], "hunkCaption");
+	assert.ok(kinds.includes("fold"), "compact-unchanged folds present at contextRadius 1");
+	assert.ok(kinds.includes("code"), "code rows present");
+	// changed code rows carry hunkIndex + lineIndex for annotation cross-reference
+	const codeRows = layout.rows.filter((r) => r.kind === "code");
+	const addRow = codeRows.find((r) => stripAnsi(r.text).includes("new4"));
+	assert.ok(addRow, "add row present");
+	assert.equal(addRow.hunkIndex, 0);
+	assert.equal(addRow.lineIndex, 4, "add row lineIndex matches its position in the hunk");
+	// truncation caps the body and sets the flag
+	const tiny = buildDiffLayout({ patch, filePath: "layout.ts", cwd, title: "unit", config: { ...config, maxRenderedLines: 2 }, highlighter: fakeHighlighter, theme: fakeTheme(), liveSession: false });
+	assert.equal(tiny.truncated, true);
+	assert.ok(tiny.rows.length <= 2, "truncation caps body rows at maxRenderedLines");
+	// renderDiffLines composes header + the same rows + footer
+	const rendered = renderDiffLines({ patch, filePath: "layout.ts", cwd, title: "unit", config, highlighter: fakeHighlighter, theme: fakeTheme(), liveSession: false });
+	const plain = rendered.map(stripAnsi).join("\n");
+	assert.match(plain, /layout\.ts/, "header present in composed render");
+	assert.match(plain, /new4/, "layout rows present in composed render");
+}
+
+// --- #11: PatchSource seam — adapters, composite, pinning equivalence --------
+// Correlation depends on the PatchSource interface, not RenderRecord. Two
+// adapters satisfy it; a composite prefers the reviewed patch and falls back to
+// the agent-edit record. Identical patch via either adapter pins a note to the
+// same PatchLineAddress. The bridge holds one source; renderers are not threaded
+// findRecent.
+{
+	const cwd = repoRoot;
+	const filePath = path.join(cwd, "src", "app.ts");
+	const patch = writePatch("a/src/app.ts", "b/src/app.ts", "line1\nline2\nold\nold\nline5\n", "line1\nline2\nnewA\nnewB\nline5\n");
+	const summary = "edited app.ts";
+
+	// Agent-edit adapter: backed by the record store.
+	const store = createRenderRecordStore();
+	store.record("call-1", { tool: "edit", filePath, patch, summary });
+	const agentSource = createAgentEditPatchSource(store);
+	const entry = agentSource.findForFile("src/app.ts", cwd);
+	assert.ok(entry, "agent-edit source resolves the record by file");
+	assert.equal(entry.patch, patch);
+	assert.equal(entry.summary, summary);
+
+	// Reviewed adapter: normalises a session-review payload (shape-tolerant).
+	const reviewedSource = createReviewedPatchSource(async () => undefined);
+	reviewedSource.hydrate({ files: [{ path: "src/app.ts", patch, summary: "reviewed app.ts" }] }, cwd);
+	const reviewedEntry = reviewedSource.findForFile("src/app.ts", cwd);
+	assert.ok(reviewedEntry, "reviewed source resolves the reviewed patch by file");
+	assert.equal(reviewedEntry.patch, patch);
+
+	// normalizeReviewPatches tolerates shape variance: alt collections, alt keys, renames.
+	const norm = normalizeReviewPatches({ items: [{ filePath: "renamed.ts", diff: patch, previousPath: "old-name.ts" }] }, cwd);
+	assert.ok(norm.get(fileKey("renamed.ts", cwd)), "items collection + filePath + diff key accepted");
+	assert.ok(norm.get(fileKey("old-name.ts", cwd)), "previousPath aliased onto the new patch");
+	assert.ok(normalizeReviewPatches([{ name: "x.ts", text: patch }], cwd).get(fileKey("x.ts", cwd)), "bare array + name + text keys accepted");
+	assert.equal(normalizeReviewPatches(undefined, cwd).size, 0, "undefined payload yields empty map");
+	assert.equal(normalizeReviewPatches({ files: [{ path: "no-patch.ts" }] }, cwd).size, 0, "file without a patch is dropped");
+
+	// Composite: reviewed wins, agent-edit is the fallback.
+	const composite = createPatchSource(reviewedSource, agentSource);
+	assert.equal(composite.findForFile("src/app.ts", cwd).summary, "reviewed app.ts", "composite prefers the reviewed patch");
+	reviewedSource.clear();
+	assert.equal(composite.findForFile("src/app.ts", cwd).summary, summary, "composite falls back to the agent-edit record when no reviewed patch");
+
+	// Load-bearing seam property: identical patch via either adapter → identical
+	// PatchLineAddress for the same note.
+	reviewedSource.hydrate({ files: [{ path: "src/app.ts", patch, summary: "reviewed app.ts" }] }, cwd);
+	const note = { id: "n1", type: "user", filePath: "src/app.ts", newLine: 4, summary: "pin on new row" };
+	const agentShape = buildReviewNoteShape([note], agentSource.findForFile, cwd);
+	const reviewedShape = buildReviewNoteShape([note], reviewedSource.findForFile, cwd);
+	assert.equal(agentShape.hunks.length, 1, "agent-edit shape pins the note onto a hunk");
+	assert.equal(reviewedShape.hunks.length, 1, "reviewed shape pins the note onto a hunk");
+	const a = agentShape.hunks[0].lines[0].address;
+	const r = reviewedShape.hunks[0].lines[0].address;
+	assert.deepEqual(
+		{ hunkIndex: a.hunkIndex, lineIndex: a.lineIndex, kind: a.kind, oldLine: a.oldLine, newLine: a.newLine },
+		{ hunkIndex: r.hunkIndex, lineIndex: r.lineIndex, kind: r.kind, oldLine: r.oldLine, newLine: r.newLine },
+		"same patch via either adapter → identical PatchLineAddress",
+	);
+
+	// Bridge holds one source; renderers are no longer threaded findRecent.
+	const bridge = createHunkBridge(createPatchSource(reviewedSource, agentSource));
+	assert.equal(bridge.renderReviewLines.length, 3, "renderReviewLines(result, cwd, theme) — findRecent no longer threaded");
+	assert.equal(bridge.renderNotesLines.length, 5, "renderNotesLines(result, cwd, theme, config, highlighter) — findRecent no longer threaded");
 }
 
 console.log("pi-hunk units ok");

@@ -1,6 +1,6 @@
 {
   "name": "@roodriigoooo/pi-hunk",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Review-first Shiki terminal diffs and spatial Hunk review notes for pi.",
   "type": "module",
   "license": "MIT",

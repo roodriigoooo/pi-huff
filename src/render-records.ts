@@ -1,4 +1,5 @@
 import { fileKey } from "./paths";
+import type { PatchEntry, PatchSource } from "./patch-source";
 
 export type RenderRecord = {
 	tool: "write" | "edit";
@@ -43,6 +44,18 @@ export function createRenderRecordStore(): RenderRecordStore {
 			const key = fileKey(filePath, cwd);
 			if (!key) return undefined;
 			return recent.find((record) => fileKey(record.filePath, cwd) === key);
+		},
+	};
+}
+
+/** Adapt a `RenderRecordStore` to the `PatchSource` seam. A `RenderRecord` carries
+ *  one extra field (`tool`) beyond `PatchEntry`; that is harmless to correlation,
+ *  which only reads `filePath`/`patch`/`summary`. This is the agent-edit source —
+ *  today's correlation behaviour — and the fallback when no reviewed patch exists. */
+export function createAgentEditPatchSource(store: RenderRecordStore): PatchSource {
+	return {
+		findForFile(filePath, cwd) {
+			return store.findRecent(filePath, cwd) as PatchEntry | undefined;
 		},
 	};
 }
